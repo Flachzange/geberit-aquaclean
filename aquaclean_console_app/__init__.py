@@ -1081,3 +1081,392 @@ async def _diag_j_get_common_settings(self):
 # Later assignment wins over the old H trigger. No production module is changed.
 _AquaCleanBaseClient.get_stored_common_settings_async = _diag_j_get_common_settings
 # === END DIAG J1 CONS-TAIL8 OVERRIDE v1 ===
+
+# === DIAG L INTERFRAME-DELAY OVERRIDE v1 ===
+#
+# Narrow follow-up after J1:
+#   - same known-destructive fixed-13 GetSPL [0..8]
+#   - vary ONLY the delay between WRITE_0/FIRST and WRITE_1/CONS
+#   - after each successful GetSPL, immediately probe 0x59
+#   - stop at first failure and reuse existing D1-D4 recovery
+#
+# Sequence:
+#   L0   0x59 baseline
+#   L1   30 ms inter-frame delay -> 0x59
+#   L2   15 ms inter-frame delay -> 0x59
+#   L3   10 ms inter-frame delay -> 0x59
+#   L4    5 ms inter-frame delay -> 0x59
+#   L5    0 ms ORIGINAL sender path -> 0x59 (deliberately last)
+#
+# Also logs:
+#   - exact wire bytes (existing _h_wire_log)
+#   - WRITE_0 return time
+#   - requested/actual gap before WRITE_1
+#   - incoming CONTROL frames and whether they arrived before/after CONS
+#   - raw GetSPL result length/hex
+#   - DTO a-byte and actual len(data_array)
+
+_L_SPL_9_TAIL8 = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+
+async def _l_probe_spl_with_interframe_delay(
+    base_client,
+    delay_ms: float,
+    label: str,
+) -> bool:
+    api_call = _H_GetSystemParameterList(list(_L_SPL_9_TAIL8))
+    connector = base_client.bluetooth_le_connector
+    frame_service = base_client.frame_service
+
+    _diag_logger.info(
+        "DIAG L %s: GetSPL fixed13 params=%s interframe_delay=%.1f ms "
+        "(RPC before=%d)",
+        label,
+        _L_SPL_9_TAIL8,
+        delay_ms,
+        _rpc_snapshot(),
+    )
+
+    _h_wire_log(base_client, api_call, label, "fixed13")
+
+    orig_send_message = connector.send_message
+    orig_send_cons = connector.send_message_cons
+    orig_handle_control = frame_service._handle_control_frame
+
+    state = {
+        "write0_call": None,
+        "write0_return": None,
+        "cons_wrapper_enter": None,
+        "cons_send": None,
+        "cons_return": None,
+        "last_control_key": None,
+        "last_control_at": 0.0,
+    }
+
+    async def _wrapped_send_message(data):
+        is_first = bool(data) and data[0] == 0x13
+        if is_first:
+            state["write0_call"] = _time.monotonic()
+            _diag_logger.info(
+                "DIAG L %s TIMING: WRITE_0 call header=0x%02X",
+                label,
+                data[0],
+            )
+
+        result = await orig_send_message(data)
+
+        if is_first:
+            state["write0_return"] = _time.monotonic()
+            elapsed_ms = (
+                (state["write0_return"] - state["write0_call"]) * 1000.0
+                if state["write0_call"] is not None
+                else -1.0
+            )
+            _diag_logger.info(
+                "DIAG L %s TIMING: WRITE_0 returned after %.3f ms",
+                label,
+                elapsed_ms,
+            )
+        return result
+
+    async def _wrapped_send_cons(data):
+        state["cons_wrapper_enter"] = _time.monotonic()
+
+        from_write0_ms = (
+            (state["cons_wrapper_enter"] - state["write0_return"]) * 1000.0
+            if state["write0_return"] is not None
+            else -1.0
+        )
+        _diag_logger.info(
+            "DIAG L %s TIMING: send_message_cons entered %.3f ms after "
+            "WRITE_0 return; inserting %.1f ms delay",
+            label,
+            from_write0_ms,
+            delay_ms,
+        )
+
+        if delay_ms > 0:
+            await _asyncio.sleep(delay_ms / 1000.0)
+
+        state["cons_send"] = _time.monotonic()
+        actual_gap_ms = (
+            (state["cons_send"] - state["write0_return"]) * 1000.0
+            if state["write0_return"] is not None
+            else -1.0
+        )
+        _diag_logger.info(
+            "DIAG L %s TIMING: WRITE_1 call now; actual gap from "
+            "WRITE_0 return=%.3f ms data=%s",
+            label,
+            actual_gap_ms,
+            bytes(data).hex(),
+        )
+
+        result = await orig_send_cons(data)
+
+        state["cons_return"] = _time.monotonic()
+        write1_ms = (
+            (state["cons_return"] - state["cons_send"]) * 1000.0
+            if state["cons_send"] is not None
+            else -1.0
+        )
+        _diag_logger.info(
+            "DIAG L %s TIMING: WRITE_1 returned after %.3f ms",
+            label,
+            write1_ms,
+        )
+        return result
+
+    def _wrapped_handle_control(tl_msg_out_ctl, frame):
+        now = _time.monotonic()
+        key = (
+            frame.ErrorCode,
+            frame.UnackdFrameLimit,
+            frame.TransactionLatency,
+            bytes(frame.AckdFrameBitmask),
+        )
+
+        # FrameService currently calls _handle_control_frame twice when the
+        # first call returns >0. Suppress only duplicate logging within 2 ms;
+        # still invoke the original handler every time to preserve behavior.
+        should_log = not (
+            state["last_control_key"] == key
+            and (now - state["last_control_at"]) < 0.002
+        )
+        if should_log:
+            if state["write0_return"] is None:
+                phase = "BEFORE_WRITE0_RETURN"
+                rel_ms = -1.0
+            elif state["cons_send"] is None:
+                phase = "BETWEEN_WRITE0_AND_WRITE1"
+                rel_ms = (now - state["write0_return"]) * 1000.0
+            else:
+                phase = "AFTER_WRITE1"
+                rel_ms = (now - state["cons_send"]) * 1000.0
+
+            _diag_logger.info(
+                "DIAG L %s CONTROL: phase=%s rel=%.3f ms error=0x%02X "
+                "unack_limit=%d transaction_latency=%d ms ack_bitmap=%s",
+                label,
+                phase,
+                rel_ms,
+                frame.ErrorCode,
+                frame.UnackdFrameLimit,
+                frame.TransactionLatency,
+                bytes(frame.AckdFrameBitmask).hex(),
+            )
+            state["last_control_key"] = key
+            state["last_control_at"] = now
+
+        return orig_handle_control(tl_msg_out_ctl, frame)
+
+    connector.send_message = _wrapped_send_message
+    connector.send_message_cons = _wrapped_send_cons
+    frame_service._handle_control_frame = _wrapped_handle_control
+
+    try:
+        response = await base_client.send_request(
+            api_call,
+            send_as_first_cons=True,
+        )
+
+        raw = bytes(base_client.message_context.result_bytes)
+        _diag_logger.info(
+            "DIAG L %s RESULT: raw_result_len=%d raw=%s",
+            label,
+            len(raw),
+            raw.hex(),
+        )
+
+        # Parse a COPY because the legacy Deserializer reverses byte slices
+        # in-place while converting ints.
+        parsed = response.result(bytearray(raw))
+        _diag_logger.info(
+            "DIAG L %s RESULT: dto_a=%s data_array_len=%d data_array=%s "
+            "(RPC now=%d)",
+            label,
+            getattr(parsed, "a", "?"),
+            len(getattr(parsed, "data_array", [])),
+            getattr(parsed, "data_array", []),
+            _rpc_snapshot(),
+        )
+        return True
+
+    except _BLEPeripheralTimeoutError:
+        _diag_logger.warning(
+            "DIAG L %s: TIMEOUT — GetSPL itself did not complete "
+            "(delay=%.1f ms, RPC now=%d)",
+            label,
+            delay_ms,
+            _rpc_snapshot(),
+        )
+        return False
+
+    except Exception as exc:
+        _diag_logger.exception(
+            "DIAG L %s: ERROR — GetSPL failed with delay=%.1f ms: %s: %s",
+            label,
+            delay_ms,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+    finally:
+        connector.send_message = orig_send_message
+        connector.send_message_cons = orig_send_cons
+        frame_service._handle_control_frame = orig_handle_control
+
+
+async def _l_delay_then_filter(
+    base_client,
+    connector,
+    owner_client,
+    device_id,
+    delay_ms: float,
+    stage: str,
+) -> bool:
+    spl_label = f"{stage}S"
+    filter_label = f"{stage}F"
+
+    if not await _l_probe_spl_with_interframe_delay(
+        base_client,
+        delay_ms,
+        spl_label,
+    ):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            f"{spl_label} GetSPL failed with {delay_ms:.1f} ms "
+            "WRITE_0→WRITE_1 delay",
+        )
+        return False
+
+    _diag_logger.info(
+        "DIAG L %s: GetSPL completed; 0x59 follows with no intentional "
+        "post-SPL quiet time",
+        filter_label,
+    )
+
+    if not await _probe_filter(base_client, filter_label):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            f"{filter_label} 0x59 failed after tail=8 GetSPL with "
+            f"{delay_ms:.1f} ms WRITE_0→WRITE_1 delay",
+        )
+        return False
+
+    _summary(
+        "%s PASS — tail=8 survives with %.1f ms WRITE_0→WRITE_1 delay.",
+        stage,
+        delay_ms,
+    )
+    return True
+
+
+async def _diag_l_get_common_settings(self):
+    # Preserve the normal production common-settings request and bypass older
+    # H/J suite triggers. This later assignment is the only active suite.
+    result = await _orig_get_common_settings(self)
+
+    armed_at = getattr(self, "_diag_boundary_initial_success_at", None)
+    already_started = getattr(self, "_diag_l_started", False)
+
+    if (
+        armed_at is None
+        or already_started
+        or (_time.monotonic() - armed_at) >= 60.0
+    ):
+        return result
+
+    self._diag_l_started = True
+
+    owner_client = getattr(self, "_diag_boundary_owner_client", None)
+    device_id = getattr(self, "_diag_boundary_device_id", None)
+    connector = self.bluetooth_le_connector
+
+    if owner_client is None or not device_id:
+        _summary(
+            "L SUITE ABORTED — owner client/device id could not be resolved."
+        )
+        return result
+
+    _diag_logger.info(
+        "DIAG L: starting WRITE_0→WRITE_1 inter-frame delay suite in SAME "
+        "BLE session at global RPC count=%d",
+        _rpc_snapshot(),
+    )
+
+    _j_log_gatt_write_semantics(connector)
+
+    # L0 — verify 0x59 is healthy before the timing experiment.
+    if not await _probe_filter(self, "L0"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "L0 baseline failed before inter-frame delay tests",
+        )
+        return result
+
+    for delay_ms, stage in (
+        (30.0, "L1"),
+        (15.0, "L2"),
+        (10.0, "L3"),
+        (5.0, "L4"),
+    ):
+        if not await _l_delay_then_filter(
+            self,
+            connector,
+            owner_client,
+            device_id,
+            delay_ms,
+            stage,
+        ):
+            return result
+
+    # L5 — exact current/original zero-delay path, deliberately last.
+    # Do not install timing wrappers here: this should reproduce the sender
+    # that previously wedged 0x59 with tail=8 as faithfully as possible.
+    _diag_logger.info(
+        "DIAG L L5S: ORIGINAL zero-delay sender path; deliberately last"
+    )
+    if not await _h_probe_spl(
+        self,
+        _L_SPL_9_TAIL8,
+        "L5S",
+        compact=False,
+    ):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "L5S original zero-delay tail=8 GetSPL failed",
+        )
+        return result
+
+    if not await _probe_filter(self, "L5F"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "L5F original zero-delay tail=8 reproduced persistent 0x59 "
+            "failure after delayed variants survived; WRITE_0→WRITE_1 "
+            "timing is strongly implicated",
+        )
+        return result
+
+    _summary(
+        "L0-L5 ALL PASS — even the original zero-delay tail=8 sequence "
+        "survived this run. Earlier destructive behavior is non-deterministic "
+        "or the extra diagnostic timing itself altered the transport."
+    )
+
+    return result
+
+
+_AquaCleanBaseClient.get_stored_common_settings_async = _diag_l_get_common_settings
+# === END DIAG L INTERFRAME-DELAY OVERRIDE v1 ===
