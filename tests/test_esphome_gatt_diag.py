@@ -77,8 +77,13 @@ class _FailingDescriptorAPIClient:
 
 
 @pytest.mark.asyncio
-async def test_diag_maps_a6_cccd_and_logs_combined_timing(caplog):
+async def test_diag_maps_a6_cccd_and_logs_combined_timing(caplog, monkeypatch):
     diag = _load_diag_module()
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(diag.asyncio, "sleep", _no_sleep)
     assert diag.install(_FakeAPIClient) is True
     assert diag.install(_FakeAPIClient) is False
 
@@ -123,3 +128,47 @@ async def test_diag_identifies_cccd_failure_stage_and_reraises(caplog):
     assert "register_ms=" in text
     assert "cccd_elapsed_ms=" in text
     assert "RuntimeError: simulated status 133" in text
+
+
+@pytest.mark.asyncio
+async def test_diag_settles_after_a5_to_a7_but_not_a8(caplog, monkeypatch):
+    diag = _load_diag_module()
+
+    sleeps = []
+
+    async def _record_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(diag.asyncio, "sleep", _record_sleep)
+
+    class _SettlingAPIClient:
+        async def bluetooth_gatt_get_services(self, address):
+            return _ServicesResponse()
+
+        async def bluetooth_gatt_start_notify(self, address, handle, callback):
+            return (lambda: None, lambda: None)
+
+        async def bluetooth_gatt_write_descriptor(self, address, handle, data):
+            return None
+
+    assert diag.install(_SettlingAPIClient) is True
+    api = _SettlingAPIClient()
+    address = int("38AB412A0D67", 16)
+
+    with caplog.at_level(logging.INFO):
+        await api.bluetooth_gatt_get_services(address)
+
+        # A5: settling pause is part of experiment #2.
+        await api.bluetooth_gatt_start_notify(address, 0x0F, lambda *_: None)
+        await api.bluetooth_gatt_write_descriptor(address, 0x10, b"\x01\x00")
+
+        # A8: final channel, therefore no trailing pause.
+        await api.bluetooth_gatt_start_notify(address, 0x1B, lambda *_: None)
+        await api.bluetooth_gatt_write_descriptor(address, 0x1C, b"\x01\x00")
+
+    assert sleeps == [pytest.approx(0.250)]
+    text = caplog.text
+    assert "stage=inter_channel_settle BEGIN" in text
+    assert "role=READ_0(A5)" in text
+    assert "settle_ms=250.0" in text
+    assert "stage=inter_channel_settle OK" in text

@@ -1,8 +1,9 @@
 """Temporary ESPHome GATT notification diagnostics.
 
 This module instruments the three aioesphomeapi operations involved in the
-AquaClean notification setup without changing their order, parameters, retry
-behaviour, or timing intentionally:
+AquaClean notification setup. Diagnostic experiment #2 intentionally adds a
+250 ms settling pause after successful A5-A7 CCCD writes while leaving order,
+parameters, and retry behaviour unchanged:
 
 * bluetooth_gatt_get_services()       -> records characteristic/CCCD handles
 * bluetooth_gatt_start_notify()       -> times notification registration
@@ -14,6 +15,7 @@ the intermittent ESP_GATT_ERROR (133) has been isolated.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import itertools
 import logging
@@ -26,6 +28,7 @@ _SERVICE_UUID = "3334429d-90f3-4c41-a02d-5cb3a03e0000"
 _CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 _SESSION_SEQ = itertools.count(1)
 _INSTALLED_ATTR = "_aquaclean_gatt_diag_installed"
+_INTER_CHANNEL_SETTLE_S = 0.250
 
 _READ_LABELS = {
     "3334429d-90f3-4c41-a02d-5cb3a53e0000": "READ_0(A5)",
@@ -33,6 +36,7 @@ _READ_LABELS = {
     "3334429d-90f3-4c41-a02d-5cb3a73e0000": "READ_2(A7)",
     "3334429d-90f3-4c41-a02d-5cb3a83e0000": "READ_3(A8)",
 }
+_SETTLE_AFTER_UUIDS = set(list(_READ_LABELS)[:-1])
 
 
 def _elapsed_ms(start: float) -> float:
@@ -269,6 +273,33 @@ def install(api_client_cls=None) -> bool:
             cccd_ms,
             total_ms,
         )
+
+        # Diagnostic experiment #2: give the ESPHome/ESP-IDF GATT state machine
+        # a short settling window after a fully completed channel setup before the
+        # caller starts the next notification channel.  A8 is the final channel,
+        # so sleeping after it would only delay the poll without testing anything.
+        if uuid in _SETTLE_AFTER_UUIDS:
+            settle_started = time.perf_counter()
+            logger.info(
+                "[GATT-DIAG] session=%s stage=inter_channel_settle BEGIN address=%s role=%s char=%s cccd=%s settle_ms=%.1f",
+                _session(self),
+                address,
+                role,
+                _fmt_handle(char_handle),
+                _fmt_handle(cccd_handle),
+                _INTER_CHANNEL_SETTLE_S * 1000.0,
+            )
+            await asyncio.sleep(_INTER_CHANNEL_SETTLE_S)
+            logger.info(
+                "[GATT-DIAG] session=%s stage=inter_channel_settle OK address=%s role=%s char=%s cccd=%s elapsed_ms=%.1f",
+                _session(self),
+                address,
+                role,
+                _fmt_handle(char_handle),
+                _fmt_handle(cccd_handle),
+                _elapsed_ms(settle_started),
+            )
+
         return result
 
     api_client_cls.bluetooth_gatt_get_services = get_services_diag
