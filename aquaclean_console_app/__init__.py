@@ -541,3 +541,389 @@ _AquaCleanBaseClient.send_request = _diag_send_request
 _AquaCleanBaseClient.get_filter_status_async = _diag_get_filter_status
 _AquaCleanBaseClient.get_stored_common_settings_async = _diag_get_common_settings
 _AquaCleanClient.connect_ble_only = _diag_client_connect_ble_only
+
+# === DIAG H-SEQUENCE OVERRIDE v1 ===
+#
+# This block deliberately overrides ONLY the diagnostic common-settings hook.
+# Existing RPC numbering, initial GetFilterStatus arming, and D1-D4 recovery
+# remain unchanged above.
+#
+# H sequence:
+#   H0   baseline 0x59
+#   H1   fixed-13, 8 params with duplicate 4 -> immediate 0x59
+#   H2A  fixed-13, 9 params tail=0 -> 10 s absolute quiet -> 0x59
+#   H2B  fixed-13, 9 params tail=0 -> immediate 0x59
+#   H3A  COMPACT, 9 params tail=4 -> 10 s absolute quiet -> 0x59
+#   H3B  COMPACT, 9 params tail=4 -> immediate 0x59
+#   H4   fixed-13, 9 params tail=4 -> 10 s absolute quiet -> 0x59
+#
+# Stop at the first failed GetSPL/GetFilterStatus and run the already-existing
+# D1-D4 recovery cascade. H4 is deliberately last because fixed-13 + tail=4 is
+# the known destructive sequence from the previous F1 run.
+
+from aquaclean_console_app.aquaclean_core.Api.CallClasses.GetSystemParameterList import (
+    GetSystemParameterList as _H_GetSystemParameterList,
+)
+
+_H_SPL_8_DUP4 = [0, 1, 2, 3, 4, 5, 6, 4]
+_H_SPL_9_TAIL0 = [0, 1, 2, 3, 4, 5, 6, 7, 0]
+_H_SPL_9_TAIL4 = [0, 1, 2, 3, 4, 5, 6, 7, 4]
+
+
+class _H_CompactGetSystemParameterList(_H_GetSystemParameterList):
+    """Diagnostic-only GetSPL with variable argument length: count + IDs."""
+
+    def get_payload(self):
+        arg_count = min(len(self.parameter_list), 12)
+        data = bytearray(1 + arg_count)
+        data[0] = arg_count
+        for i in range(arg_count):
+            data[i + 1] = self.parameter_list[i]
+        return data
+
+
+def _h_wire_log(base_client, api_call, label: str, mode: str):
+    """Log the exact bytes the current sender will derive, without sending."""
+
+    payload = api_call.get_payload()
+    rpc_body = base_client.build_payload(api_call)
+    message = base_client.message_service.build_message(rpc_body)
+    serialized_message = message.serialize()
+
+    frame = base_client.frame_factory.BuildSingleFrame(serialized_message)
+    frame.SubFrameCountOrIndex = 1
+    write_0 = frame.serialize()
+
+    # Keep this IDENTICAL to AquaCleanBaseClient.send_request().
+    write_1 = bytes([0x12]) + serialized_message[19:38]
+
+    crc_message_logical = serialized_message[: 6 + len(rpc_body)]
+
+    _diag_logger.info(
+        "DIAG H WIRE %s: mode=%s params=%s payload_len=%d rpc_body_len=%d",
+        label, mode, list(api_call.parameter_list), len(payload), len(rpc_body),
+    )
+    _diag_logger.info(
+        "DIAG H WIRE %s: PAYLOAD=%s", label, payload.hex()
+    )
+    _diag_logger.info(
+        "DIAG H WIRE %s: RPC_BODY=%s", label, rpc_body.hex()
+    )
+    _diag_logger.info(
+        "DIAG H WIRE %s: CRC_MESSAGE=%s", label, crc_message_logical.hex()
+    )
+    _diag_logger.info(
+        "DIAG H WIRE %s: WRITE_0=%s", label, bytes(write_0).hex()
+    )
+    _diag_logger.info(
+        "DIAG H WIRE %s: WRITE_1=%s", label, write_1.hex()
+    )
+
+
+async def _h_probe_spl(base_client, params, label: str, compact: bool = False) -> bool:
+    mode = "compact" if compact else "fixed13"
+    api_call_cls = (
+        _H_CompactGetSystemParameterList
+        if compact
+        else _H_GetSystemParameterList
+    )
+    api_call = api_call_cls(list(params))
+
+    _diag_logger.info(
+        "DIAG H %s: GetSPL mode=%s params=%s (RPC before=%d)",
+        label, mode, params, _rpc_snapshot(),
+    )
+
+    try:
+        _h_wire_log(base_client, api_call, label, mode)
+
+        response = await base_client.send_request(
+            api_call, send_as_first_cons=True
+        )
+        result = response.result(base_client.message_context.result_bytes)
+
+        _diag_logger.info(
+            "DIAG H %s: SUCCESS — GetSPL completed mode=%s result_count=%s "
+            "(RPC now=%d)",
+            label,
+            mode,
+            getattr(result, "a", "?"),
+            _rpc_snapshot(),
+        )
+        return True
+
+    except _BLEPeripheralTimeoutError:
+        _diag_logger.warning(
+            "DIAG H %s: TIMEOUT — GetSPL itself did not complete mode=%s "
+            "(RPC now=%d)",
+            label, mode, _rpc_snapshot(),
+        )
+        return False
+
+    except Exception as exc:
+        _diag_logger.exception(
+            "DIAG H %s: ERROR — GetSPL mode=%s failed: %s: %s",
+            label, mode, type(exc).__name__, exc,
+        )
+        return False
+
+
+async def _h_quiet(seconds: float, label: str) -> bool:
+    """Require a truly RPC-free quiet window."""
+
+    before = _rpc_snapshot()
+    _diag_logger.info(
+        "DIAG H %s: %.1f s ABSOLUTE QUIET — no AquaClean RPC "
+        "(RPC count=%d)",
+        label, seconds, before,
+    )
+
+    await _asyncio.sleep(seconds)
+
+    after = _rpc_snapshot()
+    if after != before:
+        _diag_logger.warning(
+            "DIAG H %s: QUIET WINDOW VIOLATED — RPC count changed %d -> %d",
+            label, before, after,
+        )
+        _summary(
+            "%s INVALID — intended quiet window was violated by another "
+            "AquaClean RPC (%d -> %d). Suite stopped without interpreting "
+            "the following state.",
+            label, before, after,
+        )
+        return False
+
+    _diag_logger.info(
+        "DIAG H %s: quiet window clean — RPC count stayed at %d",
+        label, after,
+    )
+    return True
+
+
+async def _h_fail(connector, owner_client, device_id, reason: str):
+    await _fail(connector, owner_client, device_id, reason)
+    return False
+
+
+async def _h_spl_then_filter(
+    base_client,
+    connector,
+    owner_client,
+    device_id,
+    params,
+    spl_label: str,
+    filter_label: str,
+    fail_reason: str,
+    *,
+    compact: bool = False,
+    quiet_seconds: float = 0.0,
+) -> bool:
+    if not await _h_probe_spl(
+        base_client, params, spl_label, compact=compact
+    ):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            f"{spl_label} GetSPL itself failed/timed out",
+        )
+        return False
+
+    if quiet_seconds > 0.0:
+        if not await _h_quiet(quiet_seconds, f"{spl_label}-QUIET"):
+            return False
+    else:
+        _diag_logger.info(
+            "DIAG H %s: NO intentional delay — 0x59 follows immediately",
+            filter_label,
+        )
+
+    if not await _probe_filter(base_client, filter_label):
+        await _h_fail(
+            connector, owner_client, device_id, fail_reason
+        )
+        return False
+
+    return True
+
+
+async def _diag_h_get_common_settings(self):
+    # Preserve the normal startup call exactly as before. The H suite begins
+    # only after the original common-settings request has completed.
+    result = await _orig_get_common_settings(self)
+
+    armed_at = getattr(self, "_diag_boundary_initial_success_at", None)
+    already_started = getattr(self, "_diag_h_started", False)
+
+    if (
+        armed_at is None
+        or already_started
+        or (_time.monotonic() - armed_at) >= 60.0
+    ):
+        return result
+
+    self._diag_h_started = True
+
+    owner_client = getattr(self, "_diag_boundary_owner_client", None)
+    device_id = getattr(self, "_diag_boundary_device_id", None)
+    connector = self.bluetooth_le_connector
+
+    if owner_client is None or not device_id:
+        _summary(
+            "H SUITE ABORTED — owner client/device id could not be resolved."
+        )
+        return result
+
+    _diag_logger.info(
+        "DIAG H: starting combined 8→9 / tail-byte / compact-length / "
+        "quiet-time suite in SAME BLE session at global RPC count=%d",
+        _rpc_snapshot(),
+    )
+
+    # H0 — baseline.
+    if not await _probe_filter(self, "H0"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "H0 baseline failed before H tests",
+        )
+        return result
+
+    # H1 — eliminate duplicate-parameter as the explanation while staying
+    # below the 8->9 boundary.
+    if not await _h_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _H_SPL_8_DUP4,
+        "H1S",
+        "H1F",
+        "H1F 0x59 failed after fixed-13 8-param SPL with duplicate 4; "
+        "duplicate parameters are implicated and the 8→9 theory is weakened",
+    ):
+        return result
+
+    _summary(
+        "H1 PASS — duplicate parameter 4 is tolerated with 8 parameters; "
+        "the previous F1 failure is not explained by the duplicate alone."
+    )
+
+    # H2A — count=9 but ninth byte is 0x00, so WRITE_1 remains all-zero.
+    # First post-SPL RPC is delayed by 10 s.
+    if not await _h_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _H_SPL_9_TAIL0,
+        "H2AS",
+        "H2AF",
+        "H2AF 0x59 failed after fixed-13 9-param SPL with tail=0 even "
+        "after 10 s quiet; count=9 / transaction shape is sufficient and "
+        "a non-zero CONS payload byte is not required",
+        quiet_seconds=10.0,
+    ):
+        return result
+
+    _summary(
+        "H2A PASS — fixed-13 count=9 with tail=0 survives when the FIRST "
+        "post-SPL RPC is delayed 10 s."
+    )
+
+    # H2B — same bytes/semantics as H2A but immediate follow-up.
+    if not await _h_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _H_SPL_9_TAIL0,
+        "H2BS",
+        "H2BF",
+        "H2BF 0x59 failed for fixed-13 9-param tail=0 only when immediate; "
+        "post-SPL timing/quiet-time is implicated even with an all-zero CONS",
+    ):
+        return result
+
+    _summary(
+        "H2B PASS — fixed-13 count=9 with tail=0 also survives an immediate "
+        "0x59; count=9 alone is not sufficient."
+    )
+
+    # H3A — same 9-param semantics as the known killer, but compact logical
+    # payload. WRITE_1 remains byte-for-byte 12 04 00...00; only FIRST's
+    # declared lengths/CRC differ.
+    if not await _h_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _H_SPL_9_TAIL4,
+        "H3AS",
+        "H3AF",
+        "H3AF 0x59 failed after COMPACT 9-param tail=4 even after 10 s quiet; "
+        "compact logical length alone does not prevent the bad state",
+        compact=True,
+        quiet_seconds=10.0,
+    ):
+        return result
+
+    _summary(
+        "H3A PASS — compact 9-param tail=4 survives after 10 s quiet."
+    )
+
+    # H3B — compact request, immediate follow-up.
+    if not await _h_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _H_SPL_9_TAIL4,
+        "H3BS",
+        "H3BF",
+        "H3BF 0x59 failed for COMPACT 9-param tail=4 only when immediate; "
+        "compact encoding helps with persistent poisoning but an immediate "
+        "post-SPL timing constraint remains",
+        compact=True,
+    ):
+        return result
+
+    _summary(
+        "H3B PASS — COMPACT 9-param tail=4 also survives immediate 0x59. "
+        "The non-zero CONS byte itself is therefore not sufficient."
+    )
+
+    # H4 — fixed-13 known-killer semantics, but FIRST following RPC is delayed
+    # 10 s. Deliberately last: previous F1 already proved the immediate variant
+    # can wedge 0x59 persistently.
+    if not await _h_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _H_SPL_9_TAIL4,
+        "H4S",
+        "H4F",
+        "H4F 0x59 failed after fixed-13 9-param tail=4 despite 10 s absolute "
+        "quiet, while compact H3 survived; fixed logical payload length / "
+        "declared message length / CRC framing is strongly implicated",
+        quiet_seconds=10.0,
+    ):
+        return result
+
+    _summary(
+        "H0-H4 ALL PASS — fixed-13 9-param tail=4 survives if the FIRST "
+        "post-SPL RPC is delayed 10 s, while the previous run showed the "
+        "immediate variant wedges 0x59. Quiet-time/timing is therefore the "
+        "leading discriminator; compact encoding also survived both variants."
+    )
+
+    return result
+
+
+# Override only the old F/Q suite trigger. All previously defined diagnostic
+# helpers, RPC numbering, startup arming and D1-D4 recovery remain active.
+_AquaCleanBaseClient.get_stored_common_settings_async = _diag_h_get_common_settings
+# === END DIAG H-SEQUENCE OVERRIDE v1 ===
