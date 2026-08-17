@@ -77,15 +77,8 @@ class _FailingDescriptorAPIClient:
 
 
 @pytest.mark.asyncio
-async def test_diag_a5_only_skips_a6_to_a8_gatt_operations(caplog, monkeypatch):
+async def test_diag_reorders_real_notify_setup_to_a6_a5_a7_a8(caplog):
     diag = _load_diag_module()
-
-    sleeps = []
-
-    async def _record_sleep(seconds):
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(diag.asyncio, "sleep", _record_sleep)
 
     class _TrackingAPIClient:
         def __init__(self):
@@ -108,25 +101,51 @@ async def test_diag_a5_only_skips_a6_to_a8_gatt_operations(caplog, monkeypatch):
     address = int("38AB412A0D67", 16)
 
     with caplog.at_level(logging.INFO):
-        await api.bluetooth_gatt_get_services(address)
-        for char_handle, cccd_handle in ((0x0F, 0x10), (0x13, 0x14), (0x17, 0x18), (0x1B, 0x1C)):
-            unsubs = await api.bluetooth_gatt_start_notify(address, char_handle, lambda *_: None)
-            assert len(unsubs) == 2
-            await api.bluetooth_gatt_write_descriptor(address, cccd_handle, b"\x01\x00")
+        response = await api.bluetooth_gatt_get_services(address)
+        service = response.services[0]
+        assert [char.handle for char in service.characteristics] == [0x13, 0x0F, 0x17, 0x1B]
 
-    assert api.notify_handles == [0x0F]
-    assert api.descriptor_handles == [0x10]
-    assert sleeps == [pytest.approx(0.250)]
+        # Mirror BluetoothLeConnector._list_services(): iterate the service in
+        # the order returned by ESPHome and complete each notify+CCCD setup.
+        for char in service.characteristics:
+            await api.bluetooth_gatt_start_notify(address, char.handle, lambda *_: None)
+            await api.bluetooth_gatt_write_descriptor(
+                address, char.descriptors[0].handle, b"\x01\x00"
+            )
+
+    assert api.notify_handles == [0x13, 0x0F, 0x17, 0x1B]
+    assert api.descriptor_handles == [0x14, 0x10, 0x18, 0x1C]
+    text = caplog.text
+    assert "stage=notify_order OK" in text
+    assert "experiment=a6_a5_a7_a8" in text
+    assert "order=A6,A5,A7,A8" in text
+    assert "inter_channel_settle" not in text
+    assert " SKIP " not in text
+
+
+@pytest.mark.asyncio
+async def test_diag_maps_a6_cccd_and_logs_combined_timing(caplog):
+    diag = _load_diag_module()
+    assert diag.install(_FakeAPIClient) is True
+    assert diag.install(_FakeAPIClient) is False
+
+    api = _FakeAPIClient()
+    address = int("38AB412A0D67", 16)
+
+    with caplog.at_level(logging.INFO):
+        await api.bluetooth_gatt_get_services(address)
+        await api.bluetooth_gatt_start_notify(address, 0x13, lambda *_: None)
+        await api.bluetooth_gatt_write_descriptor(address, 0x14, b"\x01\x00")
 
     text = caplog.text
+    assert "READ_1(A6):char=0x0013/cccd=0x0014" in text
     assert "stage=notify_setup OK" in text
-    assert "role=READ_0(A5)" in text
-    for role in ("READ_1(A6)", "READ_2(A7)", "READ_3(A8)"):
-        assert f"stage=notify_register SKIP" in text
-        assert role in text
-    assert text.count("stage=notify_register SKIP") == 3
-    assert text.count("stage=cccd_write SKIP") == 3
-    assert "experiment=a5_only" in text
+    assert "role=READ_1(A6)" in text
+    assert "char=0x0013" in text
+    assert "cccd=0x0014" in text
+    assert "register_ms=" in text
+    assert "gap_after_register_ms=" in text
+    assert "cccd_ms=" in text
 
 
 @pytest.mark.asyncio
@@ -139,47 +158,15 @@ async def test_diag_identifies_cccd_failure_stage_and_reraises(caplog):
 
     with caplog.at_level(logging.INFO):
         await api.bluetooth_gatt_get_services(address)
-        await api.bluetooth_gatt_start_notify(address, 0x0F, lambda *_: None)
+        await api.bluetooth_gatt_start_notify(address, 0x13, lambda *_: None)
         with pytest.raises(RuntimeError, match="simulated status 133"):
-            await api.bluetooth_gatt_write_descriptor(address, 0x10, b"\x01\x00")
+            await api.bluetooth_gatt_write_descriptor(address, 0x14, b"\x01\x00")
 
     text = caplog.text
     assert "stage=cccd_write ERROR" in text
-    assert "role=READ_0(A5)" in text
-    assert "char=0x000f" in text
-    assert "cccd=0x0010" in text
+    assert "role=READ_1(A6)" in text
+    assert "char=0x0013" in text
+    assert "cccd=0x0014" in text
     assert "register_ms=" in text
     assert "cccd_elapsed_ms=" in text
     assert "RuntimeError: simulated status 133" in text
-
-
-@pytest.mark.asyncio
-async def test_diag_settles_only_after_real_a5_setup(caplog, monkeypatch):
-    diag = _load_diag_module()
-
-    sleeps = []
-
-    async def _record_sleep(seconds):
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(diag.asyncio, "sleep", _record_sleep)
-    assert diag.install(_FakeAPIClient) is True
-
-    api = _FakeAPIClient()
-    address = int("38AB412A0D67", 16)
-
-    with caplog.at_level(logging.INFO):
-        await api.bluetooth_gatt_get_services(address)
-        await api.bluetooth_gatt_start_notify(address, 0x0F, lambda *_: None)
-        await api.bluetooth_gatt_write_descriptor(address, 0x10, b"\x01\x00")
-        await api.bluetooth_gatt_start_notify(address, 0x13, lambda *_: None)
-        await api.bluetooth_gatt_write_descriptor(address, 0x14, b"\x01\x00")
-
-    assert sleeps == [pytest.approx(0.250)]
-    text = caplog.text
-    assert "stage=inter_channel_settle BEGIN" in text
-    assert "role=READ_0(A5)" in text
-    assert "settle_ms=250.0" in text
-    assert "stage=inter_channel_settle OK" in text
-    assert "stage=notify_register SKIP" in text
-    assert "role=READ_1(A6)" in text

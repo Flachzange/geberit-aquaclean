@@ -1,10 +1,11 @@
 """Temporary ESPHome GATT notification diagnostics.
 
 This module instruments the three aioesphomeapi operations involved in the
-AquaClean notification setup. Diagnostic experiment #3 keeps the 250 ms pause
-after A5 from experiment #2, but suppresses the actual notify registration and
-CCCD writes for A6-A8. This yields an A5-only ESPHome GATT subscription without
-changing the production connector code:
+AquaClean notification setup. Diagnostic experiment #4 changes exactly one
+variable: for the standard AquaClean GATT service it exposes the READ notify
+characteristics to the connector in A6 -> A5 -> A7 -> A8 order instead of the
+native A5 -> A6 -> A7 -> A8 order. Parameters, retries and timing are otherwise
+left untouched:
 
 * bluetooth_gatt_get_services()       -> records characteristic/CCCD handles
 * bluetooth_gatt_start_notify()       -> times notification registration
@@ -16,7 +17,6 @@ the intermittent ESP_GATT_ERROR (133) has been isolated.
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import itertools
 import logging
@@ -29,7 +29,6 @@ _SERVICE_UUID = "3334429d-90f3-4c41-a02d-5cb3a03e0000"
 _CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 _SESSION_SEQ = itertools.count(1)
 _INSTALLED_ATTR = "_aquaclean_gatt_diag_installed"
-_INTER_CHANNEL_SETTLE_S = 0.250
 
 _READ_LABELS = {
     "3334429d-90f3-4c41-a02d-5cb3a53e0000": "READ_0(A5)",
@@ -37,9 +36,13 @@ _READ_LABELS = {
     "3334429d-90f3-4c41-a02d-5cb3a73e0000": "READ_2(A7)",
     "3334429d-90f3-4c41-a02d-5cb3a83e0000": "READ_3(A8)",
 }
-_A5_UUID = next(iter(_READ_LABELS))
-_SKIP_NOTIFY_UUIDS = set(list(_READ_LABELS)[1:])
-_SETTLE_AFTER_UUIDS = {_A5_UUID}
+_EXPERIMENT_NOTIFY_ORDER = (
+    "3334429d-90f3-4c41-a02d-5cb3a63e0000",  # A6 first
+    "3334429d-90f3-4c41-a02d-5cb3a53e0000",  # then A5
+    "3334429d-90f3-4c41-a02d-5cb3a73e0000",  # A7
+    "3334429d-90f3-4c41-a02d-5cb3a83e0000",  # A8
+)
+_EXPERIMENT_RANK = {uuid: rank for rank, uuid in enumerate(_EXPERIMENT_NOTIFY_ORDER)}
 
 
 def _elapsed_ms(start: float) -> float:
@@ -86,6 +89,60 @@ def _cccd_meta(api: Any, cccd_handle: Any) -> tuple[Any, str, str]:
     if meta is None:
         return (None, "unknown", "unknown")
     return meta
+
+
+def _reorder_notify_characteristics_for_experiment(response: Any) -> bool:
+    """Expose standard AquaClean READ characteristics as A6, A5, A7, A8.
+
+    Only the relative order of the four known READ characteristics is changed;
+    every other characteristic remains at its original list position. This keeps
+    the experiment limited to notification setup order while allowing the normal
+    connector/ESPHomeAPIClient code to perform all real start-notify and CCCD
+    operations (including its normal unsubscribe bookkeeping).
+    """
+    changed = False
+    for service in getattr(response, "services", ()) or ():
+        if str(getattr(service, "uuid", "")).lower() != _SERVICE_UUID:
+            continue
+
+        target = getattr(service, "characteristics", None)
+        if target is None:
+            continue
+        chars = list(target)
+        read_positions = [
+            idx
+            for idx, char in enumerate(chars)
+            if str(getattr(char, "uuid", "")).lower() in _EXPERIMENT_RANK
+        ]
+        if len(read_positions) < 2:
+            continue
+
+        reads = [chars[idx] for idx in read_positions]
+        ordered_reads = sorted(
+            reads,
+            key=lambda char: _EXPERIMENT_RANK[str(getattr(char, "uuid", "")).lower()],
+        )
+        if reads == ordered_reads:
+            continue
+
+        reordered = list(chars)
+        for idx, char in zip(read_positions, ordered_reads):
+            reordered[idx] = char
+
+        try:
+            target[:] = reordered
+        except Exception:
+            try:
+                del target[:]
+                target.extend(reordered)
+            except Exception:
+                logger.warning(
+                    "[GATT-DIAG] stage=notify_order SKIP reason=characteristics_not_mutable experiment=a6_a5_a7_a8"
+                )
+                continue
+        changed = True
+
+    return changed
 
 
 def _extract_geberit_map(response: Any) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[int, str, str]], str]:
@@ -155,6 +212,7 @@ def install(api_client_cls=None) -> bool:
             raise
 
         session = next(_SESSION_SEQ)
+        reordered = _reorder_notify_characteristics_for_experiment(response)
         chars, cccds, plan = _extract_geberit_map(response)
         setattr(self, "_aquaclean_gatt_diag_session", session)
         setattr(self, "_aquaclean_gatt_diag_chars", chars)
@@ -169,6 +227,12 @@ def install(api_client_cls=None) -> bool:
             _elapsed_ms(started),
             plan,
         )
+        logger.info(
+            "[GATT-DIAG] session=%s stage=notify_order %s address=%s experiment=a6_a5_a7_a8 order=A6,A5,A7,A8",
+            session,
+            "OK" if reordered else "UNCHANGED",
+            address,
+        )
         return response
 
     @functools.wraps(original_start_notify)
@@ -176,20 +240,6 @@ def install(api_client_cls=None) -> bool:
         address = _arg(args, kwargs, 0, "address")
         handle = _arg(args, kwargs, 1, "handle")
         uuid, role = _char_meta(self, handle)
-        if uuid in _SKIP_NOTIFY_UUIDS:
-            logger.info(
-                "[GATT-DIAG] session=%s stage=notify_register SKIP address=%s role=%s char=%s uuid=%s experiment=a5_only",
-                _session(self),
-                address,
-                role,
-                _fmt_handle(handle),
-                uuid,
-            )
-            # ESPHomeAPIClient expects the aioesphomeapi call to return two
-            # unsubscribe callbacks. Return inert callbacks so its bookkeeping
-            # remains unchanged while no A6-A8 GATT operation reaches the proxy.
-            return (lambda: None, lambda: None)
-
         started = time.perf_counter()
         logger.debug(
             "[GATT-DIAG] session=%s stage=notify_register BEGIN address=%s role=%s char=%s uuid=%s",
@@ -238,18 +288,6 @@ def install(api_client_cls=None) -> bool:
         address = _arg(args, kwargs, 0, "address")
         cccd_handle = _arg(args, kwargs, 1, "handle", "descriptor_handle")
         char_handle, uuid, role = _cccd_meta(self, cccd_handle)
-        if uuid in _SKIP_NOTIFY_UUIDS:
-            logger.info(
-                "[GATT-DIAG] session=%s stage=cccd_write SKIP address=%s role=%s char=%s cccd=%s uuid=%s experiment=a5_only",
-                _session(self),
-                address,
-                role,
-                _fmt_handle(char_handle),
-                _fmt_handle(cccd_handle),
-                uuid,
-            )
-            return None
-
         notify_ms = None
         notify_end = None
         if char_handle is not None:
@@ -302,32 +340,6 @@ def install(api_client_cls=None) -> bool:
             cccd_ms,
             total_ms,
         )
-
-        # Diagnostic experiment #3 retains the 250 ms A5 settling window from
-        # experiment #2. A6-A8 are skipped above, so A5 is the only real channel
-        # setup and the only point where a settling delay can occur.
-        if uuid in _SETTLE_AFTER_UUIDS:
-            settle_started = time.perf_counter()
-            logger.info(
-                "[GATT-DIAG] session=%s stage=inter_channel_settle BEGIN address=%s role=%s char=%s cccd=%s settle_ms=%.1f",
-                _session(self),
-                address,
-                role,
-                _fmt_handle(char_handle),
-                _fmt_handle(cccd_handle),
-                _INTER_CHANNEL_SETTLE_S * 1000.0,
-            )
-            await asyncio.sleep(_INTER_CHANNEL_SETTLE_S)
-            logger.info(
-                "[GATT-DIAG] session=%s stage=inter_channel_settle OK address=%s role=%s char=%s cccd=%s elapsed_ms=%.1f",
-                _session(self),
-                address,
-                role,
-                _fmt_handle(char_handle),
-                _fmt_handle(cccd_handle),
-                _elapsed_ms(settle_started),
-            )
-
         return result
 
     api_client_cls.bluetooth_gatt_get_services = get_services_diag
