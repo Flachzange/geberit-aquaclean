@@ -927,3 +927,157 @@ async def _diag_h_get_common_settings(self):
 # helpers, RPC numbering, startup arming and D1-D4 recovery remain active.
 _AquaCleanBaseClient.get_stored_common_settings_async = _diag_h_get_common_settings
 # === END DIAG H-SEQUENCE OVERRIDE v1 ===
+
+# === DIAG J1 CONS-TAIL8 OVERRIDE v1 ===
+#
+# Narrow follow-up after H diagnostics:
+#   J0  GetFilterStatus baseline
+#   J1  fixed-13 GetSPL [0,1,2,3,4,5,6,7,8]
+#       -> first actual CONS payload byte = 0x08
+#       -> 10.0 s absolute AquaClean-RPC quiet
+#       -> GetFilterStatus
+#
+# The existing H suite remains in the file for history, but this later hook
+# replaces its trigger. Existing RPC numbering, startup arming and D1-D4
+# recovery remain active.
+
+_J_SPL_9_TAIL8 = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+
+def _j_log_gatt_write_semantics(connector):
+    """Log how the ESPHome wrapper will choose ATT write semantics."""
+
+    client = getattr(connector, "client", None)
+    props_map = getattr(client, "_uuid_to_properties", None)
+
+    if not isinstance(props_map, dict):
+        _diag_logger.info(
+            "DIAG J GATT: client=%s has no _uuid_to_properties map; "
+            "write-type auto-detection cannot be introspected here",
+            type(client).__name__ if client is not None else "None",
+        )
+        return
+
+    for label, uuid_value in (
+        ("WRITE_0", connector.BULK_CHAR_BULK_WRITE_0_UUID),
+        ("WRITE_1", connector.BULK_CHAR_BULK_WRITE_1_UUID),
+    ):
+        uuid_str = str(uuid_value).lower()
+        props = props_map.get(uuid_str)
+
+        if props is None:
+            _diag_logger.warning(
+                "DIAG J GATT %s: uuid=%s not present in discovered property map",
+                label, uuid_str,
+            )
+            continue
+
+        has_write_no_resp = bool(props & 0x04)
+        has_write = bool(props & 0x08)
+
+        # ESPHomeAPIClient.write_gatt_char(response=None) currently uses:
+        #   response = not bool(props & 0x04)
+        auto_response = not has_write_no_resp
+
+        _diag_logger.info(
+            "DIAG J GATT %s: uuid=%s properties=0x%02X "
+            "WRITE_NO_RESP=%s WRITE=%s => auto_response=%s "
+            "(%s)",
+            label,
+            uuid_str,
+            props,
+            has_write_no_resp,
+            has_write,
+            auto_response,
+            "ATT_WRITE_REQUEST" if auto_response else "ATT_WRITE_COMMAND",
+        )
+
+
+async def _diag_j_get_common_settings(self):
+    # Preserve the production common-settings call. Do NOT call the H hook,
+    # otherwise the old broad H suite would run before J.
+    result = await _orig_get_common_settings(self)
+
+    armed_at = getattr(self, "_diag_boundary_initial_success_at", None)
+    already_started = getattr(self, "_diag_j_started", False)
+
+    if (
+        armed_at is None
+        or already_started
+        or (_time.monotonic() - armed_at) >= 60.0
+    ):
+        return result
+
+    self._diag_j_started = True
+
+    owner_client = getattr(self, "_diag_boundary_owner_client", None)
+    device_id = getattr(self, "_diag_boundary_device_id", None)
+    connector = self.bluetooth_le_connector
+
+    if owner_client is None or not device_id:
+        _summary(
+            "J SUITE ABORTED — owner client/device id could not be resolved."
+        )
+        return result
+
+    _diag_logger.info(
+        "DIAG J: starting narrow tail-byte test in SAME BLE session "
+        "at global RPC count=%d",
+        _rpc_snapshot(),
+    )
+
+    # Capture the GATT property-derived write semantics without altering them.
+    _j_log_gatt_write_semantics(connector)
+
+    # J0 — baseline after normal startup.
+    if not await _probe_filter(self, "J0"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "J0 baseline failed before tail=8 test",
+        )
+        return result
+
+    # J1 — count=9, no duplicate, ninth parameter is 8.
+    # With the current fixed-13 sender this places 0x08 as the first real
+    # CrcMessage byte carried in WRITE_1/CONS.
+    if not await _h_probe_spl(
+        self, _J_SPL_9_TAIL8, "J1S", compact=False
+    ):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "J1S fixed-13 9-param tail=8 GetSPL itself failed/timed out",
+        )
+        return result
+
+    if not await _h_quiet(10.0, "J1S-QUIET"):
+        return result
+
+    if not await _probe_filter(self, "J1F"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "J1F 0x59 failed after fixed-13 9-param GetSPL with tail=8 "
+            "despite 10 s absolute quiet; a non-zero real CONS payload byte "
+            "other than 0x04 is sufficient, strongly implicating outgoing "
+            "CONS content/transport rather than parameter 4 specifically",
+        )
+        return result
+
+    _summary(
+        "J1 PASS — fixed-13 9-param tail=8 survives 10 s quiet and 0x59. "
+        "Since tail=4 previously wedged 0x59 while tail=0 and tail=8 survive, "
+        "the trigger is NOT simply 'any non-zero CONS byte'; value/parameter "
+        "specificity or another framing interaction is implicated."
+    )
+
+    return result
+
+
+# Later assignment wins over the old H trigger. No production module is changed.
+_AquaCleanBaseClient.get_stored_common_settings_async = _diag_j_get_common_settings
+# === END DIAG J1 CONS-TAIL8 OVERRIDE v1 ===
