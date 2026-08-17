@@ -1470,3 +1470,282 @@ async def _diag_l_get_common_settings(self):
 
 _AquaCleanBaseClient.get_stored_common_settings_async = _diag_l_get_common_settings
 # === END DIAG L INTERFRAME-DELAY OVERRIDE v1 ===
+
+# === DIAG M SPL-SPLIT OVERRIDE v1 ===
+#
+# Direct production-fix experiment:
+#
+#   M0  GetFilterStatus baseline
+#   M1  GetSPL [12]       -> immediate 0x59
+#   M2  GetSPL [13]       -> immediate 0x59
+#   M3  GetSPL [12,13]    -> immediate 0x59
+#   M4  GetSPL [0..7] + GetSPL [12,13] -> immediate 0x59
+#       (candidate production split)
+#   M5  GetSPL [0..7,12,13] -> immediate 0x59
+#       (current production list; deliberately last)
+#
+# The suite stops at the first failure and reuses D1-D4 recovery.
+# Older H/J/L suite code remains for history but this later hook is the only
+# active trigger.
+
+_M_SPL_12 = [12]
+_M_SPL_13 = [13]
+_M_SPL_12_13 = [12, 13]
+_M_SPL_BASE = [0, 1, 2, 3, 4, 5, 6, 7]
+_M_SPL_CURRENT_COMBINED = [0, 1, 2, 3, 4, 5, 6, 7, 12, 13]
+
+
+async def _m_probe_spl(base_client, params, label: str) -> bool:
+    api_call = _H_GetSystemParameterList(list(params))
+
+    _diag_logger.info(
+        "DIAG M %s: GetSPL params=%s (RPC before=%d)",
+        label,
+        params,
+        _rpc_snapshot(),
+    )
+    _h_wire_log(base_client, api_call, label, "fixed13")
+
+    try:
+        response = await base_client.send_request(
+            api_call,
+            send_as_first_cons=True,
+        )
+
+        raw = bytes(base_client.message_context.result_bytes)
+        _diag_logger.info(
+            "DIAG M %s RESULT: raw_result_len=%d raw=%s",
+            label,
+            len(raw),
+            raw.hex(),
+        )
+
+        parsed = response.result(bytearray(raw))
+        _diag_logger.info(
+            "DIAG M %s RESULT: dto_a=%s data_array_len=%d data_array=%s "
+            "(RPC now=%d)",
+            label,
+            getattr(parsed, "a", "?"),
+            len(getattr(parsed, "data_array", [])),
+            getattr(parsed, "data_array", []),
+            _rpc_snapshot(),
+        )
+        return True
+
+    except _BLEPeripheralTimeoutError:
+        _diag_logger.warning(
+            "DIAG M %s: TIMEOUT — GetSPL itself did not complete "
+            "(RPC now=%d)",
+            label,
+            _rpc_snapshot(),
+        )
+        return False
+
+    except Exception as exc:
+        _diag_logger.exception(
+            "DIAG M %s: ERROR — GetSPL failed: %s: %s",
+            label,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
+async def _m_spl_then_filter(
+    base_client,
+    connector,
+    owner_client,
+    device_id,
+    params,
+    stage: str,
+) -> bool:
+    spl_label = f"{stage}S"
+    filter_label = f"{stage}F"
+
+    if not await _m_probe_spl(base_client, params, spl_label):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            f"{spl_label} GetSPL failed for params={params}",
+        )
+        return False
+
+    if not await _probe_filter(base_client, filter_label):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            f"{filter_label} 0x59 failed after GetSPL params={params}",
+        )
+        return False
+
+    _summary(
+        "%s PASS — GetSPL params=%s followed immediately by working 0x59.",
+        stage,
+        params,
+    )
+    return True
+
+
+async def _diag_m_get_common_settings(self):
+    # Keep normal common-settings startup behavior. Bypass all earlier suite
+    # triggers by calling the original production method directly.
+    result = await _orig_get_common_settings(self)
+
+    armed_at = getattr(self, "_diag_boundary_initial_success_at", None)
+    already_started = getattr(self, "_diag_m_started", False)
+
+    if (
+        armed_at is None
+        or already_started
+        or (_time.monotonic() - armed_at) >= 60.0
+    ):
+        return result
+
+    self._diag_m_started = True
+
+    owner_client = getattr(self, "_diag_boundary_owner_client", None)
+    device_id = getattr(self, "_diag_boundary_device_id", None)
+    connector = self.bluetooth_le_connector
+
+    if owner_client is None or not device_id:
+        _summary(
+            "M SUITE ABORTED — owner client/device id could not be resolved."
+        )
+        return result
+
+    _diag_logger.info(
+        "DIAG M: starting SPL split-vs-combined production experiment in "
+        "SAME BLE session at global RPC count=%d",
+        _rpc_snapshot(),
+    )
+
+    _j_log_gatt_write_semantics(connector)
+
+    # M0 — baseline.
+    if not await _probe_filter(self, "M0"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "M0 baseline failed before SPL split experiment",
+        )
+        return result
+
+    # M1 — parameter 12 alone.
+    if not await _m_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _M_SPL_12,
+        "M1",
+    ):
+        return result
+
+    # M2 — parameter 13 alone.
+    if not await _m_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _M_SPL_13,
+        "M2",
+    ):
+        return result
+
+    # M3 — both extra production parameters in one small request.
+    if not await _m_spl_then_filter(
+        self,
+        connector,
+        owner_client,
+        device_id,
+        _M_SPL_12_13,
+        "M3",
+    ):
+        return result
+
+    # M4 — candidate production pattern: first base live-state batch, then
+    # the two extra position parameters as a separate small batch.
+    _diag_logger.info(
+        "DIAG M M4: candidate production split begins: %s THEN %s",
+        _M_SPL_BASE,
+        _M_SPL_12_13,
+    )
+
+    if not await _m_probe_spl(self, _M_SPL_BASE, "M4AS"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "M4AS base [0..7] GetSPL failed",
+        )
+        return result
+
+    if not await _m_probe_spl(self, _M_SPL_12_13, "M4BS"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "M4BS [12,13] GetSPL failed after base [0..7] batch",
+        )
+        return result
+
+    if not await _probe_filter(self, "M4F"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "M4F 0x59 failed after candidate production split "
+            "[0..7] + [12,13]",
+        )
+        return result
+
+    _summary(
+        "M4 PASS — candidate production split [0..7] + [12,13] preserves "
+        "0x59 immediately afterward."
+    )
+
+    # M5 — exact current production list in one request. This is the direct
+    # A/B control and is deliberately last because its real CONS bytes are
+    # expected to reproduce the persistent WC-side failure.
+    _diag_logger.info(
+        "DIAG M M5: CURRENT COMBINED production list; deliberately last"
+    )
+
+    if not await _m_probe_spl(
+        self,
+        _M_SPL_CURRENT_COMBINED,
+        "M5S",
+    ):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "M5S current combined production GetSPL itself failed",
+        )
+        return result
+
+    if not await _probe_filter(self, "M5F"):
+        await _h_fail(
+            connector,
+            owner_client,
+            device_id,
+            "M5F current combined [0..7,12,13] wedges 0x59 while split "
+            "[0..7]+[12,13] passed; production polling should be split into "
+            "two GetSPL requests so real parameter bytes never enter CONS",
+        )
+        return result
+
+    _summary(
+        "M0-M5 ALL PASS — both split and current combined production lists "
+        "preserved 0x59 in this run. The earlier CONS-triggered failure is "
+        "not deterministic enough to justify a split-only production fix yet."
+    )
+
+    return result
+
+
+_AquaCleanBaseClient.get_stored_common_settings_async = _diag_m_get_common_settings
+# === END DIAG M SPL-SPLIT OVERRIDE v1 ===
