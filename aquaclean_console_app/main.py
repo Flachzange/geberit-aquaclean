@@ -15,7 +15,7 @@ from aiorun import run, shutdown_waits_for
 
 from bleak import BleakScanner
 from bleak.exc import BleakError
-from aquaclean_console_app.aquaclean_core.Clients.AquaCleanClient                   import AquaCleanClient
+from aquaclean_console_app.aquaclean_core.Clients.AquaCleanClient                   import AquaCleanClient, SPL_PARAMS_MERA_COMFORT_STATE, SPL_PARAMS_MERA_COMFORT_OFFSETS
 from aquaclean_console_app.aquaclean_core.Clients.AquaCleanBaseClient               import BLEPeripheralTimeoutError
 from aquaclean_console_app.aquaclean_core.IAquaCleanClient                          import IAquaCleanClient
 from aquaclean_console_app.aquaclean_core.AquaCleanClientFactory                    import AquaCleanClientFactory
@@ -2992,18 +2992,27 @@ class ApiMode:
             return
 
     async def _fetch_state(self, client, _skip_profile: bool = False):
-        result = await client.base_client.get_system_parameter_list_async(SPL_PARAMS_MERA_COMFORT)
+        # Keep real GetSPL parameters inside WRITE_0.  On RS30.0 TS206 the
+        # combined [0..7,12,13] request returns successfully but wedges
+        # GetFilterStatus (0x59) until the WC is power-cycled.
+        state_result = await client.base_client.get_system_parameter_list_async(
+            SPL_PARAMS_MERA_COMFORT_STATE
+        )
+        offset_result = await client.base_client.get_system_parameter_list_async(
+            SPL_PARAMS_MERA_COMFORT_OFFSETS
+        )
+
         # Update device_state before _on_demand's finally fires so the
         # "disconnected" SSE broadcast carries fresh values.
-        self.service.device_state["is_user_sitting"]           = result.data_array[0] != 0
-        self.service.device_state["is_anal_shower_running"]    = result.data_array[3] != 0  # param 3 confirmed = anal shower
-        self.service.device_state["is_lady_shower_running"]    = result.data_array[2] != 0
-        self.service.device_state["is_dryer_running"]          = result.data_array[1] != 0  # param 1, dryer state unknown
-        self.service.device_state["last_error_code"]           = result.data_array[6]
-        self.service.device_state["lid_offset_position"]       = result.data_array[8]  # SPL index 12, position 8
-        self.service.device_state["shower_arm_offset_position"] = result.data_array[9]  # SPL index 13, position 9
-        self.service.device_state["descaling_state"]            = result.data_array[4]  # SPL index 4: 0=idle 1=preparing 2=waiting 3=running
-        self.service.device_state["descaling_duration_min"]     = result.data_array[5]  # SPL index 5: countdown minutes
+        self.service.device_state["is_user_sitting"]            = state_result.data_array[0] != 0
+        self.service.device_state["is_anal_shower_running"]     = state_result.data_array[3] != 0  # param 3 confirmed = anal shower
+        self.service.device_state["is_lady_shower_running"]     = state_result.data_array[2] != 0
+        self.service.device_state["is_dryer_running"]           = state_result.data_array[1] != 0  # param 1, dryer state unknown
+        self.service.device_state["last_error_code"]            = state_result.data_array[6]
+        self.service.device_state["lid_offset_position"]        = offset_result.data_array[0]  # SPL index 12
+        self.service.device_state["shower_arm_offset_position"] = offset_result.data_array[1]  # SPL index 13
+        self.service.device_state["descaling_state"]            = state_result.data_array[4]  # SPL index 4: 0=idle 1=preparing 2=waiting 3=running
+        self.service.device_state["descaling_duration_min"]     = state_result.data_array[5]  # SPL index 5: countdown minutes
         state = {
             "is_user_sitting":            self.service.device_state["is_user_sitting"],
             "is_anal_shower_running":     self.service.device_state["is_anal_shower_running"],

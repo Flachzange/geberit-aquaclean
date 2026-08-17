@@ -82,8 +82,64 @@ def test_main_does_not_import_removed_combined_spl_constant():
     assert "AquaCleanClient" in imported_names
     assert "SPL_PARAMS_MERA_COMFORT" not in imported_names
 
+
+
+def test_ondemand_fetch_state_uses_same_safe_split():
+    main_path = Path(__file__).resolve().parents[1] / "aquaclean_console_app" / "main.py"
+    main_source = main_path.read_text(encoding="utf-8")
+    main_tree = ast.parse(main_source)
+
+    api_mode = next(
+        node for node in main_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ApiMode"
+    )
+    fetch_state = next(
+        node for node in api_mode.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_fetch_state"
+    )
+    source = ast.get_source_segment(main_source, fetch_state) or ""
+
+    assert source.count("get_system_parameter_list_async(") == 2
+    assert "SPL_PARAMS_MERA_COMFORT_STATE" in source
+    assert "SPL_PARAMS_MERA_COMFORT_OFFSETS" in source
+
+    assert 'state_result.data_array[0]' in source
+    assert 'state_result.data_array[1]' in source
+    assert 'state_result.data_array[2]' in source
+    assert 'state_result.data_array[3]' in source
+    assert 'state_result.data_array[4]' in source
+    assert 'state_result.data_array[5]' in source
+    assert 'state_result.data_array[6]' in source
+    assert 'offset_result.data_array[0]' in source
+    assert 'offset_result.data_array[1]' in source
+
+    assert "result.data_array[8]" not in source
+    assert "result.data_array[9]" not in source
+
+
+def test_no_runtime_reference_to_removed_combined_spl_symbol():
+    repo = Path(__file__).resolve().parents[1]
+    offenders = []
+
+    for path in repo.rglob("*.py"):
+        # Ignore generated caches/virtual envs if present in a developer checkout.
+        if any(part in {".git", ".venv", "venv", "__pycache__"} for part in path.parts):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "SPL_PARAMS_MERA_COMFORT":
+                offenders.append(f"{path.relative_to(repo)}:{getattr(node, 'lineno', '?')}")
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "SPL_PARAMS_MERA_COMFORT":
+                        offenders.append(f"{path.relative_to(repo)}:{getattr(node, 'lineno', '?')}")
+
+    assert offenders == [], "stale SPL_PARAMS_MERA_COMFORT runtime refs: " + ", ".join(offenders)
+
 if __name__ == "__main__":
     test_mera_spl_batches_stay_within_safe_boundary()
     test_state_poll_uses_two_getspl_requests_and_maps_offsets_from_second_result()
     test_main_does_not_import_removed_combined_spl_constant()
+    test_ondemand_fetch_state_uses_same_safe_split()
+    test_no_runtime_reference_to_removed_combined_spl_symbol()
     print("split SPL regression checks: OK")
