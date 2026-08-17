@@ -1,34 +1,32 @@
-"""One-shot GetFilterStatus / GetSPL state-machine diagnostic.
+"""One-shot GetFilterStatus escalation diagnostic.
 
-Goal: extract as much information as possible from ONE WC power-cycle.
+Goal: learn as much as possible from ONE WC power-cycle while staying in the
+same BLE session.  Tests become progressively more "SPL-like" and STOP at the
+first GetFilterStatus failure.
 
-The suite runs automatically during the first on-demand startup session after
-GetFilterStatus succeeds:
+The production startup has already done its normal first GetFilterStatus and
+normal full bridge-order SPL before this suite starts.
 
-  A) SAME BLE SESSION
-     - control GetFilterStatus
-     - repeat bridge-order SPL [0..7,12,13] in the same BLE session
-     - GetFilterStatus again
+Escalation, all in the SAME BLE session:
 
-  B) NEW BLE SESSION, IPHONE SPL ORDER
-     - disconnect/reconnect + normal 0x11/0x13 subscription sequence
-     - control GetFilterStatus
-     - SPL [13,12,0,1,2,3,4,5,6,7]
-     - GetFilterStatus again
+  E0  control GetFilterStatus
+  E1  3 x GetDeviceIdentification, then GetFilterStatus
+  E2  GetSPL [0], then GetFilterStatus
+  E3  GetSPL [0,1,2,3,4,5,6,7], then GetFilterStatus
+  E4  GetSPL [13,12,0,1,2,3,4,5,6,7] (iPhone order), then GetFilterStatus
+  E5  GetSPL [0,1,2,3,4,5,6,7,12,13] (bridge order), then GetFilterStatus
 
-  C) NEW BLE SESSION, BRIDGE SPL ORDER
-     - disconnect/reconnect + normal 0x11/0x13 subscription sequence
-     - control GetFilterStatus
-     - SPL [0,1,2,3,4,5,6,7,12,13]
-     - GetFilterStatus again
+Every AquaClean send_request() is logged with one global monotonically
+increasing RPC number, including the normal startup and any recovery clients.
 
-If any stage wedges 0x59, recovery D runs immediately:
-  D1) wait 10 s, retry in same BLE session
-  D2) BLE-only disconnect/reconnect using the same client/connector
-  D3) full transport close + completely fresh Connector/AquaCleanClient
-  D4) restart ESP32 proxy, wait, then use another fresh Connector/AquaCleanClient
+At the FIRST 0x59 timeout the escalation stops and recovery D runs:
 
-Production main.py remains unchanged. This file is temporary diagnostic code only.
+  D1  wait 10 s, same BLE session, retry 0x59
+  D2  BLE-only disconnect/reconnect, same client/connector, retry 0x59
+  D3  full transport close + fresh Connector/AquaCleanClient, retry 0x59
+  D4  restart ESP32 proxy, wait 15 s + another fresh client, retry 0x59
+
+Production main.py remains unchanged. This module is temporary diagnostic code.
 """
 
 import asyncio as _asyncio
@@ -48,42 +46,121 @@ from aquaclean_console_app.bluetooth_le.LE.BluetoothLeConnector import (
 
 _diag_logger = _logging.getLogger("aquaclean_console_app.main")
 
-_BRIDGE_SPL = [0, 1, 2, 3, 4, 5, 6, 7, 12, 13]
-_IPHONE_SPL = [13, 12, 0, 1, 2, 3, 4, 5, 6, 7]
+_SPL_MINI = [0]
+_SPL_8 = [0, 1, 2, 3, 4, 5, 6, 7]
+_SPL_IPHONE_10 = [13, 12, 0, 1, 2, 3, 4, 5, 6, 7]
+_SPL_BRIDGE_10 = [0, 1, 2, 3, 4, 5, 6, 7, 12, 13]
 
+_orig_send_request = _AquaCleanBaseClient.send_request
 _orig_get_filter_status = _AquaCleanBaseClient.get_filter_status_async
 _orig_get_common_settings = _AquaCleanBaseClient.get_stored_common_settings_async
 _orig_get_spl = _AquaCleanBaseClient.get_system_parameter_list_async
+_orig_get_identification = _AquaCleanBaseClient.get_device_identification_async
 _orig_client_connect_ble_only = _AquaCleanClient.connect_ble_only
 _orig_connector_disconnect_ble_only = _BluetoothLeConnector.disconnect_ble_only
 _orig_connector_disconnect = _BluetoothLeConnector.disconnect
 
-_diag_clients_by_connector = {}
+_diag_rpc_global_count = 0
+
+
+def _fmt_byte(value):
+    if isinstance(value, int):
+        return f"0x{value:02X}"
+    if isinstance(value, bytes) and len(value) == 1:
+        return f"0x{value[0]:02X}"
+    if isinstance(value, str) and len(value) == 1:
+        return f"0x{ord(value):02X}"
+    return str(value)
+
+
+def _rpc_snapshot():
+    return _diag_rpc_global_count
 
 
 def _diag_summary(message: str, *args):
-    _diag_logger.info("DIAG SUITE SUMMARY: " + message, *args)
+    _diag_logger.info("DIAG ESCALATION SUMMARY: " + message, *args)
+
+
+async def _diag_send_request(self, api_call, send_as_first_cons=False):
+    global _diag_rpc_global_count
+    _diag_rpc_global_count += 1
+    rpc_no = _diag_rpc_global_count
+
+    try:
+        attr = api_call.get_api_call_attribute()
+        ctx = _fmt_byte(getattr(attr, "context", "?"))
+        proc = _fmt_byte(getattr(attr, "procedure", "?"))
+    except Exception:
+        ctx = "?"
+        proc = "?"
+
+    _diag_logger.info(
+        "DIAG RPC #%03d: %s ctx=%s proc=%s first_cons=%s",
+        rpc_no,
+        api_call.__class__.__name__,
+        ctx,
+        proc,
+        bool(send_as_first_cons),
+    )
+
+    try:
+        result = await _orig_send_request(
+            self, api_call, send_as_first_cons=send_as_first_cons
+        )
+        _diag_logger.info(
+            "DIAG RPC #%03d: COMPLETE %s", rpc_no, api_call.__class__.__name__
+        )
+        return result
+    except Exception as exc:
+        _diag_logger.warning(
+            "DIAG RPC #%03d: FAILED %s — %s: %s",
+            rpc_no,
+            api_call.__class__.__name__,
+            type(exc).__name__,
+            exc,
+        )
+        raise
 
 
 async def _probe_filter(base_client, label: str) -> bool:
-    _diag_logger.info("DIAG SUITE %s: testing GetFilterStatus 0x59", label)
+    before = _rpc_snapshot()
+    _diag_logger.info(
+        "DIAG ESCALATION %s: testing GetFilterStatus 0x59 (RPC count before=%d)",
+        label, before
+    )
     try:
         await _orig_get_filter_status(base_client)
-        _diag_logger.info("DIAG SUITE %s: SUCCESS — 0x59 responded", label)
+        _diag_logger.info(
+            "DIAG ESCALATION %s: SUCCESS — 0x59 responded (RPC count now=%d)",
+            label, _rpc_snapshot()
+        )
         return True
     except _BLEPeripheralTimeoutError:
-        _diag_logger.warning("DIAG SUITE %s: TIMEOUT — 0x59 did not complete", label)
+        _diag_logger.warning(
+            "DIAG ESCALATION %s: TIMEOUT — 0x59 did not complete (RPC count now=%d)",
+            label, _rpc_snapshot()
+        )
         return False
 
 
 async def _probe_spl(base_client, params, label: str) -> bool:
-    _diag_logger.info("DIAG SUITE %s: sending GetSPL params=%s", label, params)
+    before = _rpc_snapshot()
+    _diag_logger.info(
+        "DIAG ESCALATION %s: sending GetSPL params=%s (RPC count before=%d)",
+        label, params, before
+    )
     try:
         await _orig_get_spl(base_client, params)
-        _diag_logger.info("DIAG SUITE %s: SUCCESS — GetSPL completed", label)
+        _diag_logger.info(
+            "DIAG ESCALATION %s: SUCCESS — GetSPL completed (RPC count now=%d)",
+            label, _rpc_snapshot()
+        )
         return True
     except _BLEPeripheralTimeoutError:
-        _diag_logger.warning("DIAG SUITE %s: TIMEOUT — GetSPL itself did not complete", label)
+        _diag_logger.warning(
+            "DIAG ESCALATION %s: TIMEOUT — GetSPL itself did not complete (RPC count now=%d)",
+            label, _rpc_snapshot()
+        )
         return False
 
 
@@ -101,14 +178,18 @@ async def _safe_ble_disconnect(connector):
     try:
         await _orig_connector_disconnect_ble_only(connector)
     except Exception as exc:
-        _diag_logger.warning("DIAG SUITE: BLE-only cleanup failed: %s", exc)
+        _diag_logger.warning(
+            "DIAG ESCALATION: BLE-only cleanup failed: %s", exc
+        )
 
 
 async def _safe_full_disconnect(connector):
     try:
         await _orig_connector_disconnect(connector)
     except Exception as exc:
-        _diag_logger.warning("DIAG SUITE: full connector cleanup failed: %s", exc)
+        _diag_logger.warning(
+            "DIAG ESCALATION: full connector cleanup failed: %s", exc
+        )
 
 
 async def _recovery_suite(connector, client, device_id: str, reason: str):
@@ -116,38 +197,37 @@ async def _recovery_suite(connector, client, device_id: str, reason: str):
     base_client = client.base_client
 
     _diag_logger.warning(
-        "DIAG SUITE D: recovery cascade starting because %s", reason
+        "DIAG ESCALATION D: recovery cascade starting because %s", reason
     )
 
-    # D1 — distinguish a transient post-SPL quiet-time problem from persistent state.
     _diag_logger.info(
-        "DIAG SUITE D1: waiting 10 s in the SAME BLE session before retrying 0x59"
+        "DIAG ESCALATION D1: waiting 10 s in SAME BLE session"
     )
     await _asyncio.sleep(10.0)
     if await _probe_filter(base_client, "D1"):
         _diag_summary(
-            "RECOVERED after 10 s in same BLE session — failure is transient/timing-related, not persistent."
+            "RECOVERED at D1 after 10 s in same BLE session. Failure is transient/timing-related."
         )
         return "D1"
 
-    # D2 — same Python objects / same persistent ESPHome API, fresh BLE session.
     _diag_logger.info(
-        "DIAG SUITE D2: BLE-only disconnect/reconnect with SAME client/connector"
+        "DIAG ESCALATION D2: BLE-only disconnect/reconnect with SAME client/connector"
     )
     await _safe_ble_disconnect(connector)
     try:
         await _orig_client_connect_ble_only(client, device_id)
         if await _probe_filter(base_client, "D2"):
             _diag_summary(
-                "RECOVERED after BLE-only reconnect — poisoned state is session-local; ESPHome API/Python objects can stay alive."
+                "RECOVERED at D2 after BLE-only reconnect. Poisoned state is BLE-session-local."
             )
             return "D2"
     except Exception as exc:
-        _diag_logger.warning("DIAG SUITE D2: reconnect failed: %s", exc)
+        _diag_logger.warning(
+            "DIAG ESCALATION D2: reconnect failed: %s", exc
+        )
 
-    # D3 — close the persistent API transport and throw away all protocol/parser objects.
     _diag_logger.info(
-        "DIAG SUITE D3: full disconnect, then NEW BluetoothLeConnector + NEW AquaCleanClient"
+        "DIAG ESCALATION D3: full disconnect + NEW BluetoothLeConnector + NEW AquaCleanClient"
     )
     await _safe_full_disconnect(connector)
 
@@ -156,35 +236,40 @@ async def _recovery_suite(connector, client, device_id: str, reason: str):
         await _orig_client_connect_ble_only(fresh_client, device_id)
         if await _probe_filter(fresh_client.base_client, "D3"):
             _diag_summary(
-                "RECOVERED with completely fresh Python client/connector — state was in bridge/transport objects, not persistently in the WC."
+                "RECOVERED at D3 with fresh Python client/connector. Bridge/transport object state is implicated."
             )
             return "D3"
     except Exception as exc:
-        _diag_logger.warning("DIAG SUITE D3: fresh-client connect/test failed: %s", exc)
+        _diag_logger.warning(
+            "DIAG ESCALATION D3: fresh-client connect/test failed: %s", exc
+        )
     finally:
         await _safe_full_disconnect(fresh_connector)
 
-    # D4 — now separate ESP32/proxy state from WC state.
     esphome_host = getattr(connector, "esphome_host", None)
     if not esphome_host:
         _diag_summary(
-            "D1-D3 failed and no ESPHome proxy is configured — persistent WC-side state is strongly suspected."
+            "D1-D3 failed and no ESPHome proxy is configured. Persistent WC-side state is strongly suspected."
         )
         return "NO_ESPHOME"
 
     _diag_logger.info(
-        "DIAG SUITE D4: restarting ESP32 proxy (WC remains powered), then testing with another fresh client"
+        "DIAG ESCALATION D4: restarting ESP32 proxy; WC remains powered"
     )
     try:
         await connector.restart_esp32_async()
     except Exception as exc:
-        _diag_logger.warning("DIAG SUITE D4: ESP32 restart command failed: %s", exc)
+        _diag_logger.warning(
+            "DIAG ESCALATION D4: ESP32 restart command failed: %s", exc
+        )
         _diag_summary(
-            "D1-D3 failed; ESP32 restart could not be executed. WC-vs-proxy distinction remains open."
+            "D1-D3 failed; D4 restart could not be executed. WC-vs-proxy distinction remains open."
         )
         return "D4_RESTART_FAILED"
 
-    _diag_logger.info("DIAG SUITE D4: ESP32 restart sent; waiting 15 s for proxy boot")
+    _diag_logger.info(
+        "DIAG ESCALATION D4: ESP32 restart sent; waiting 15 s for proxy boot"
+    )
     await _asyncio.sleep(15.0)
 
     fresh2_connector, fresh2_client = _new_fresh_client_from(connector)
@@ -192,16 +277,18 @@ async def _recovery_suite(connector, client, device_id: str, reason: str):
         await _orig_client_connect_ble_only(fresh2_client, device_id)
         if await _probe_filter(fresh2_client.base_client, "D4"):
             _diag_summary(
-                "RECOVERED only after ESP32 restart — ESPHome proxy/transport state is implicated; WC power-cycle is NOT required."
+                "RECOVERED at D4 only after ESP32 restart. ESPHome proxy/transport state is implicated."
             )
             return "D4"
     except Exception as exc:
-        _diag_logger.warning("DIAG SUITE D4: post-restart connect/test failed: %s", exc)
+        _diag_logger.warning(
+            "DIAG ESCALATION D4: post-restart connect/test failed: %s", exc
+        )
     finally:
         await _safe_full_disconnect(fresh2_connector)
 
     _diag_summary(
-        "D1-D4 all failed — 0x59 survives wait, BLE reconnect, fresh Python/ESPHome connection, and ESP32 restart. Persistent state inside the WC is now strongly indicated; WC power-cycle remains the recovery."
+        "D1-D4 all failed. 0x59 survived neither wait, BLE reconnect, fresh Python/ESPHome connection nor ESP32 restart. Persistent state inside the WC is strongly indicated."
     )
     return "WC"
 
@@ -209,13 +296,14 @@ async def _recovery_suite(connector, client, device_id: str, reason: str):
 async def _diag_get_filter_status(self):
     result = await _orig_get_filter_status(self)
 
-    # Only the first successful production GetFilterStatus after process start arms
-    # the one-shot suite. Diagnostic probes call _orig_get_filter_status directly.
-    if not getattr(self, "_diag_suite_initial_filter_seen", False):
-        self._diag_suite_initial_filter_seen = True
-        self._diag_suite_initial_success_at = _time.monotonic()
+    # Diagnostic calls use _orig_get_filter_status directly, so only the normal
+    # production startup call reaches this wrapper.
+    if not getattr(self, "_diag_escalation_initial_filter_seen", False):
+        self._diag_escalation_initial_filter_seen = True
+        self._diag_escalation_initial_success_at = _time.monotonic()
         _diag_logger.info(
-            "DIAG SUITE #1: normal startup GetFilterStatus SUCCESS — one-shot suite armed"
+            "DIAG ESCALATION #1: normal startup GetFilterStatus SUCCESS at global RPC #%03d — suite armed",
+            _rpc_snapshot(),
         )
 
     return result
@@ -223,18 +311,21 @@ async def _diag_get_filter_status(self):
 
 async def _diag_client_connect_ble_only(self, device_id: str):
     result = await _orig_client_connect_ble_only(self, device_id)
-    connector = self.base_client.bluetooth_le_connector
-    _diag_clients_by_connector[id(connector)] = (self, device_id)
-    self.base_client._diag_suite_owner_client = self
-    self.base_client._diag_suite_device_id = device_id
+    self.base_client._diag_escalation_owner_client = self
+    self.base_client._diag_escalation_device_id = device_id
     return result
+
+
+async def _stop_and_recover(self, connector, owner_client, device_id, reason):
+    await _recovery_suite(connector, owner_client, device_id, reason)
+    return False
 
 
 async def _diag_get_common_settings(self):
     result = await _orig_get_common_settings(self)
 
-    armed_at = getattr(self, "_diag_suite_initial_success_at", None)
-    already_started = getattr(self, "_diag_suite_started", False)
+    armed_at = getattr(self, "_diag_escalation_initial_success_at", None)
+    already_started = getattr(self, "_diag_escalation_started", False)
 
     if (
         armed_at is None
@@ -243,164 +334,141 @@ async def _diag_get_common_settings(self):
     ):
         return result
 
-    owner_client = getattr(self, "_diag_suite_owner_client", None)
-    device_id = getattr(self, "_diag_suite_device_id", None)
+    self._diag_escalation_started = True
+
+    owner_client = getattr(self, "_diag_escalation_owner_client", None)
+    device_id = getattr(self, "_diag_escalation_device_id", None)
     connector = self.bluetooth_le_connector
 
     if owner_client is None or not device_id:
-        _diag_logger.warning(
-            "DIAG SUITE: startup probe armed but owner client/device id could not be resolved; suite aborted"
+        _diag_summary(
+            "ABORTED — owner client/device id could not be resolved."
         )
-        self._diag_suite_started = True
-        self._diag_suite_after_disconnect_done = True
         return result
-
-    self._diag_suite_started = True
 
     _diag_logger.info(
-        "DIAG SUITE A: SAME-SESSION test begins — no BLE disconnect has occurred"
+        "DIAG ESCALATION: starting progressive SAME-SESSION ladder at global RPC count=%d",
+        _rpc_snapshot(),
     )
 
-    # A0: old #2 control point. Confirms that the complete startup sequence itself
-    # has not already killed 0x59.
-    if not await _probe_filter(self, "A0"):
-        self._diag_suite_after_disconnect_done = True
-        await _recovery_suite(
+    # E0 — control after complete normal startup sequence.
+    if not await _probe_filter(self, "E0"):
+        await _stop_and_recover(
             connector, owner_client, device_id,
-            "A0 control failed before the repeated same-session SPL",
+            "E0 control failed before escalation",
         )
         return result
 
-    # Small quiet time so the test is not merely measuring two immediate back-to-back
-    # transactions after the startup common-settings burst.
-    await _asyncio.sleep(1.0)
+    # E1 — add generic, known-good RPC traffic without SPL.
+    _diag_logger.info(
+        "DIAG ESCALATION E1: sending 3 x GetDeviceIdentification before next 0x59"
+    )
+    for i in range(1, 4):
+        try:
+            await _orig_get_identification(self, 0)
+            _diag_logger.info(
+                "DIAG ESCALATION E1.%d: GetDeviceIdentification SUCCESS (RPC count now=%d)",
+                i, _rpc_snapshot()
+            )
+        except _BLEPeripheralTimeoutError:
+            await _stop_and_recover(
+                connector, owner_client, device_id,
+                f"E1.{i} GetDeviceIdentification itself timed out",
+            )
+            return result
 
-    # A1/A2: same connection, same subscription registration, second bridge-order SPL.
-    if not await _probe_spl(self, _BRIDGE_SPL, "A1"):
-        self._diag_suite_after_disconnect_done = True
-        await _recovery_suite(
+    if not await _probe_filter(self, "E1F"):
+        await _stop_and_recover(
             connector, owner_client, device_id,
-            "A1 second bridge-order SPL timed out in the same BLE session",
+            "E1F 0x59 failed after three extra non-SPL identification RPCs",
         )
         return result
 
-    if not await _probe_filter(self, "A2"):
-        self._diag_suite_after_disconnect_done = True
-        await _recovery_suite(
-            connector, owner_client, device_id,
-            "A2 0x59 failed after a second bridge-order SPL in the SAME BLE session",
-        )
-        return result
-
-    self._diag_suite_phase_a_success = True
     _diag_summary(
-        "A PASS — a second bridge-order SPL in the SAME BLE session does NOT kill 0x59. Next: session-change tests B/C."
+        "E1 PASS — three extra non-SPL RPCs did not kill 0x59; pure call-count/traffic threshold becomes less likely."
     )
+
+    # E2 — minimal repeated 0x0D request.
+    if not await _probe_spl(self, _SPL_MINI, "E2"):
+        await _stop_and_recover(
+            connector, owner_client, device_id,
+            "E2 minimal GetSPL [0] itself timed out",
+        )
+        return result
+
+    if not await _probe_filter(self, "E2F"):
+        await _stop_and_recover(
+            connector, owner_client, device_id,
+            "E2F 0x59 failed after minimal GetSPL [0]; repeated proc 0x0D itself is sufficient",
+        )
+        return result
+
+    _diag_summary(
+        "E2 PASS — repeated GetSPL procedure 0x0D with one parameter does NOT kill 0x59."
+    )
+
+    # E3 — eight values; still no meaningful tail IDs 12/13.
+    if not await _probe_spl(self, _SPL_8, "E3"):
+        await _stop_and_recover(
+            connector, owner_client, device_id,
+            "E3 eight-parameter GetSPL itself timed out",
+        )
+        return result
+
+    if not await _probe_filter(self, "E3F"):
+        await _stop_and_recover(
+            connector, owner_client, device_id,
+            "E3F 0x59 failed after GetSPL [0..7]; request/response size up to eight params is sufficient",
+        )
+        return result
+
+    _diag_summary(
+        "E3 PASS — GetSPL [0..7] does NOT kill 0x59. Any later failure is tied to the 10-param form/order/tail."
+    )
+
+    # E4 — exact parameter set in observed iPhone order.
+    if not await _probe_spl(self, _SPL_IPHONE_10, "E4"):
+        await _stop_and_recover(
+            connector, owner_client, device_id,
+            "E4 iPhone-order ten-parameter GetSPL itself timed out",
+        )
+        return result
+
+    if not await _probe_filter(self, "E4F"):
+        await _stop_and_recover(
+            connector, owner_client, device_id,
+            "E4F 0x59 failed after iPhone-order 10-param GetSPL; ten-param/12+13 behavior is sufficient even with iPhone order",
+        )
+        return result
+
+    _diag_summary(
+        "E4 PASS — iPhone-order 10-param SPL preserves 0x59. Bridge order / placement of 12+13 becomes the prime suspect."
+    )
+
+    # E5 — current bridge order. Deliberately LAST because this was already shown
+    # to be destructive in the previous run.
+    if not await _probe_spl(self, _SPL_BRIDGE_10, "E5"):
+        await _stop_and_recover(
+            connector, owner_client, device_id,
+            "E5 bridge-order ten-parameter GetSPL itself timed out",
+        )
+        return result
+
+    if not await _probe_filter(self, "E5F"):
+        await _stop_and_recover(
+            connector, owner_client, device_id,
+            "E5F 0x59 failed after bridge-order 10-param SPL while iPhone order survived; ordering/CONS placement is strongly implicated",
+        )
+        return result
+
+    _diag_summary(
+        "E0-E5 ALL PASS — generic RPC traffic, repeated proc 0x0D, 1-param, 8-param, iPhone 10-param and bridge 10-param SPL all preserved 0x59. The earlier failure is non-deterministic or depends on another state/timing variable."
+    )
+
     return result
 
 
-async def _run_session_test(client, device_id: str, params, phase: str, description: str):
-    base_client = client.base_client
-    connector = base_client.bluetooth_le_connector
-
-    _diag_logger.info(
-        "DIAG SUITE %s: NEW BLE session — %s", phase, description
-    )
-    try:
-        await _orig_client_connect_ble_only(client, device_id)
-    except Exception as exc:
-        _diag_logger.warning("DIAG SUITE %s0: BLE reconnect failed: %s", phase, exc)
-        return False, "connect"
-
-    if not await _probe_filter(base_client, f"{phase}0"):
-        return False, "control"
-
-    await _asyncio.sleep(0.5)
-
-    if not await _probe_spl(base_client, params, f"{phase}1"):
-        return False, "spl"
-
-    if not await _probe_filter(base_client, f"{phase}2"):
-        return False, "post"
-
-    _diag_logger.info(
-        "DIAG SUITE %s: PASS — 0x59 survived this session/SPL combination", phase
-    )
-    return True, None
-
-
-async def _diag_disconnect_ble_only(self):
-    entry = _diag_clients_by_connector.get(id(self))
-    run_bc = False
-    client = None
-    device_id = None
-    base_client = None
-
-    if entry is not None:
-        client, device_id = entry
-        base_client = client.base_client
-        run_bc = (
-            getattr(base_client, "_diag_suite_phase_a_success", False)
-            and not getattr(base_client, "_diag_suite_after_disconnect_done", False)
-        )
-        if run_bc:
-            # Arm before the production disconnect so nested/cleanup calls cannot
-            # start the suite twice.
-            base_client._diag_suite_after_disconnect_done = True
-
-    # Always perform the production BLE-only disconnect first.
-    await _orig_connector_disconnect_ble_only(self)
-
-    if not run_bc:
-        return
-
-    try:
-        # B — iPhone order. This is the same 10 parameters but with 13/12 in the
-        # FIRST frame instead of at the tail/CONS part used by the bridge order.
-        ok, fail_stage = await _run_session_test(
-            client,
-            device_id,
-            _IPHONE_SPL,
-            "B",
-            "iPhone SPL order [13,12,0,1,2,3,4,5,6,7]",
-        )
-        if not ok:
-            await _recovery_suite(
-                self, client, device_id,
-                f"B failed at {fail_stage}: new session + iPhone-order SPL path",
-            )
-            return
-
-        # B succeeded. Disconnect cleanly before creating C.
-        await _safe_ble_disconnect(self)
-
-        # C — exact current bridge order.
-        ok, fail_stage = await _run_session_test(
-            client,
-            device_id,
-            _BRIDGE_SPL,
-            "C",
-            "bridge SPL order [0,1,2,3,4,5,6,7,12,13]",
-        )
-        if not ok:
-            await _recovery_suite(
-                self, client, device_id,
-                f"C failed at {fail_stage}: new session + bridge-order SPL path",
-            )
-            return
-
-        _diag_summary(
-            "A+B+C ALL PASS — same-session repeat, new-session iPhone order, and new-session bridge order all preserve 0x59. The previous failure is therefore non-deterministic or depends on timing/state not reproduced by this one-shot sequence."
-        )
-
-    except Exception as exc:
-        _diag_logger.exception("DIAG SUITE: unexpected exception in B/C suite: %s", exc)
-    finally:
-        # Leave the production connector in the state expected by on-demand mode.
-        await _safe_ble_disconnect(self)
-
-
+_AquaCleanBaseClient.send_request = _diag_send_request
 _AquaCleanBaseClient.get_filter_status_async = _diag_get_filter_status
 _AquaCleanBaseClient.get_stored_common_settings_async = _diag_get_common_settings
 _AquaCleanClient.connect_ble_only = _diag_client_connect_ble_only
-_BluetoothLeConnector.disconnect_ble_only = _diag_disconnect_ble_only
