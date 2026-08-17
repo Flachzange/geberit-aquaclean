@@ -63,7 +63,27 @@ def test_state_poll_uses_two_getspl_requests_and_maps_offsets_from_second_result
     assert "[0, 1, 2, 3, 4, 5, 6, 7, 12, 13]" not in source
 
 
+
+
+def test_main_does_not_import_removed_combined_spl_constant():
+    main_path = Path(__file__).resolve().parents[1] / "aquaclean_console_app" / "main.py"
+    main_source = main_path.read_text(encoding="utf-8")
+    main_tree = ast.parse(main_source)
+
+    ac_imports = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module
+        == "aquaclean_console_app.aquaclean_core.Clients.AquaCleanClient"
+    ]
+    assert len(ac_imports) == 1
+    imported_names = {alias.name for alias in ac_imports[0].names}
+    assert "AquaCleanClient" in imported_names
+    assert "SPL_PARAMS_MERA_COMFORT" not in imported_names
+
 if __name__ == "__main__":
     test_mera_spl_batches_stay_within_safe_boundary()
     test_state_poll_uses_two_getspl_requests_and_maps_offsets_from_second_result()
+    test_main_does_not_import_removed_combined_spl_constant()
     print("split SPL regression checks: OK")

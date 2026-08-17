@@ -15,7 +15,7 @@ from aiorun import run, shutdown_waits_for
 
 from bleak import BleakScanner
 from bleak.exc import BleakError
-from aquaclean_console_app.aquaclean_core.Clients.AquaCleanClient                   import AquaCleanClient, SPL_PARAMS_MERA_COMFORT
+from aquaclean_console_app.aquaclean_core.Clients.AquaCleanClient                   import AquaCleanClient
 from aquaclean_console_app.aquaclean_core.Clients.AquaCleanBaseClient               import BLEPeripheralTimeoutError
 from aquaclean_console_app.aquaclean_core.IAquaCleanClient                          import IAquaCleanClient
 from aquaclean_console_app.aquaclean_core.AquaCleanClientFactory                    import AquaCleanClientFactory
