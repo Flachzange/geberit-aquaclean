@@ -1,9 +1,10 @@
 """Temporary ESPHome GATT notification diagnostics.
 
 This module instruments the three aioesphomeapi operations involved in the
-AquaClean notification setup. Diagnostic experiment #2 intentionally adds a
-250 ms settling pause after successful A5-A7 CCCD writes while leaving order,
-parameters, and retry behaviour unchanged:
+AquaClean notification setup. Diagnostic experiment #3 keeps the 250 ms pause
+after A5 from experiment #2, but suppresses the actual notify registration and
+CCCD writes for A6-A8. This yields an A5-only ESPHome GATT subscription without
+changing the production connector code:
 
 * bluetooth_gatt_get_services()       -> records characteristic/CCCD handles
 * bluetooth_gatt_start_notify()       -> times notification registration
@@ -36,7 +37,9 @@ _READ_LABELS = {
     "3334429d-90f3-4c41-a02d-5cb3a73e0000": "READ_2(A7)",
     "3334429d-90f3-4c41-a02d-5cb3a83e0000": "READ_3(A8)",
 }
-_SETTLE_AFTER_UUIDS = set(list(_READ_LABELS)[:-1])
+_A5_UUID = next(iter(_READ_LABELS))
+_SKIP_NOTIFY_UUIDS = set(list(_READ_LABELS)[1:])
+_SETTLE_AFTER_UUIDS = {_A5_UUID}
 
 
 def _elapsed_ms(start: float) -> float:
@@ -173,6 +176,20 @@ def install(api_client_cls=None) -> bool:
         address = _arg(args, kwargs, 0, "address")
         handle = _arg(args, kwargs, 1, "handle")
         uuid, role = _char_meta(self, handle)
+        if uuid in _SKIP_NOTIFY_UUIDS:
+            logger.info(
+                "[GATT-DIAG] session=%s stage=notify_register SKIP address=%s role=%s char=%s uuid=%s experiment=a5_only",
+                _session(self),
+                address,
+                role,
+                _fmt_handle(handle),
+                uuid,
+            )
+            # ESPHomeAPIClient expects the aioesphomeapi call to return two
+            # unsubscribe callbacks. Return inert callbacks so its bookkeeping
+            # remains unchanged while no A6-A8 GATT operation reaches the proxy.
+            return (lambda: None, lambda: None)
+
         started = time.perf_counter()
         logger.debug(
             "[GATT-DIAG] session=%s stage=notify_register BEGIN address=%s role=%s char=%s uuid=%s",
@@ -221,6 +238,18 @@ def install(api_client_cls=None) -> bool:
         address = _arg(args, kwargs, 0, "address")
         cccd_handle = _arg(args, kwargs, 1, "handle", "descriptor_handle")
         char_handle, uuid, role = _cccd_meta(self, cccd_handle)
+        if uuid in _SKIP_NOTIFY_UUIDS:
+            logger.info(
+                "[GATT-DIAG] session=%s stage=cccd_write SKIP address=%s role=%s char=%s cccd=%s uuid=%s experiment=a5_only",
+                _session(self),
+                address,
+                role,
+                _fmt_handle(char_handle),
+                _fmt_handle(cccd_handle),
+                uuid,
+            )
+            return None
+
         notify_ms = None
         notify_end = None
         if char_handle is not None:
@@ -274,10 +303,9 @@ def install(api_client_cls=None) -> bool:
             total_ms,
         )
 
-        # Diagnostic experiment #2: give the ESPHome/ESP-IDF GATT state machine
-        # a short settling window after a fully completed channel setup before the
-        # caller starts the next notification channel.  A8 is the final channel,
-        # so sleeping after it would only delay the poll without testing anything.
+        # Diagnostic experiment #3 retains the 250 ms A5 settling window from
+        # experiment #2. A6-A8 are skipped above, so A5 is the only real channel
+        # setup and the only point where a settling delay can occur.
         if uuid in _SETTLE_AFTER_UUIDS:
             settle_started = time.perf_counter()
             logger.info(
