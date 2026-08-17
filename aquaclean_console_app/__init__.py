@@ -6,6 +6,7 @@ Test-only shim. It performs:
   disconnect_ble_only()
   immediate reconnect
   #3 GetFilterStatus in the new BLE session
+  #4 GetFilterStatus immediately after the first later GetSPL call
 
 Production bridge flow in main.py remains unchanged.
 """
@@ -27,6 +28,7 @@ from aquaclean_console_app.bluetooth_le.LE.BluetoothLeConnector import (
 _diag_logger = _logging.getLogger("aquaclean_console_app.main")
 _orig_get_filter_status = _AquaCleanBaseClient.get_filter_status_async
 _orig_get_common_settings = _AquaCleanBaseClient.get_stored_common_settings_async
+_orig_get_spl = _AquaCleanBaseClient.get_system_parameter_list_async
 _orig_client_connect_ble_only = _AquaCleanClient.connect_ble_only
 _orig_connector_disconnect_ble_only = _BluetoothLeConnector.disconnect_ble_only
 _diag_clients_by_connector = {}
@@ -97,8 +99,10 @@ async def _diag_disconnect_ble_only(self):
         _diag_logger.info("DIAG GetFilterStatus #3: BLE reconnect successful; testing 0x59")
         try:
             await _orig_get_filter_status(base_client)
+            base_client._diag_filterstatus_post_disconnect_success = True
             _diag_logger.info("DIAG GetFilterStatus #3: SUCCESS — 0x59 survives disconnect/reconnect")
         except _BLEPeripheralTimeoutError:
+            base_client._diag_filterstatus_post_disconnect_success = False
             _diag_logger.warning("DIAG GetFilterStatus #3: TIMEOUT — 0x59 becomes stuck immediately after disconnect/reconnect")
     except Exception as exc:
         _diag_logger.warning("DIAG GetFilterStatus #3: RECONNECT FAILED — %s", exc)
@@ -109,7 +113,37 @@ async def _diag_disconnect_ble_only(self):
             pass
 
 
+async def _diag_get_spl(self, *args, **kwargs):
+    result = await _orig_get_spl(self, *args, **kwargs)
+
+    # After #3 proved that a bare disconnect/reconnect is harmless, the first
+    # later SPL call is the next isolated candidate. Probe 0x59 immediately after
+    # that SPL response, while the same BLE session is still open.
+    ready = getattr(self, "_diag_filterstatus_post_disconnect_success", False)
+    already_done = getattr(self, "_diag_filterstatus_fourth_done", False)
+    if ready and not already_done:
+        self._diag_filterstatus_fourth_done = True
+        _diag_logger.info(
+            "DIAG GetFilterStatus #4: first SPL after successful #3 completed; "
+            "testing 0x59 before BLE disconnect"
+        )
+        try:
+            await _orig_get_filter_status(self)
+            self._diag_filterstatus_fourth_success = True
+            _diag_logger.info(
+                "DIAG GetFilterStatus #4: SUCCESS — 0x59 still works immediately after later SPL"
+            )
+        except _BLEPeripheralTimeoutError:
+            self._diag_filterstatus_fourth_success = False
+            _diag_logger.warning(
+                "DIAG GetFilterStatus #4: TIMEOUT — later SPL makes 0x59 stuck before BLE disconnect"
+            )
+
+    return result
+
+
 _AquaCleanBaseClient.get_filter_status_async = _diag_get_filter_status
 _AquaCleanBaseClient.get_stored_common_settings_async = _diag_get_common_settings
+_AquaCleanBaseClient.get_system_parameter_list_async = _diag_get_spl
 _AquaCleanClient.connect_ble_only = _diag_client_connect_ble_only
 _BluetoothLeConnector.disconnect_ble_only = _diag_disconnect_ble_only
