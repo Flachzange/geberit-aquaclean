@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # GetSystemParameterList (proc 0x0D) indices used for AquaClean Mera Comfort.
 #
-# IMPORTANT — keep the live-state and offset queries split.
+# IMPORTANT — keep the primary and auxiliary queries split.
 #
 # On Mera firmware RS30.0 TS206, a single 10-parameter GetSPL request
 # [0,1,2,3,4,5,6,7,12,13] completes successfully and returns all values, but
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # NOTE: if support for other AquaClean models is added, use a per-model
 # parameter selection; do not extend either batch past the safe boundary.
 SPL_PARAMS_MERA_COMFORT_STATE = [0, 1, 2, 3, 4, 5, 6, 7]
-SPL_PARAMS_MERA_COMFORT_OFFSETS = [12, 13]
+SPL_PARAMS_MERA_COMFORT_AUX = [12, 13]
 
 class AquaCleanClient(IAquaCleanClient):
     def __init__(self, bluetooth_connector):
@@ -106,8 +106,8 @@ class AquaCleanClient(IAquaCleanClient):
         state_result = await self.base_client.get_system_parameter_list_async(
             SPL_PARAMS_MERA_COMFORT_STATE
         )
-        offset_result = await self.base_client.get_system_parameter_list_async(
-            SPL_PARAMS_MERA_COMFORT_OFFSETS
+        aux_result = await self.base_client.get_system_parameter_list_async(
+            SPL_PARAMS_MERA_COMFORT_AUX
         )
 
         device_state_changed_event_args = DeviceStateChangedEventArgs(
@@ -115,8 +115,8 @@ class AquaCleanClient(IAquaCleanClient):
             IsAnalShowerRunning=state_result.data_array[3] != 0,  # param 3 confirmed = anal shower
             IsLadyShowerRunning=state_result.data_array[2] != 0,
             IsDryerRunning=state_result.data_array[1] != 0,  # param 1, dryer state unknown
-            LidOffsetPosition=offset_result.data_array[0],       # SPL index 12
-            ShowerArmOffsetPosition=offset_result.data_array[1], # SPL index 13
+            LidOffsetPosition=aux_result.data_array[0],       # legacy field name; SPL index 12
+            ShowerArmOffsetPosition=aux_result.data_array[1], # legacy field name; SPL index 13
         )
 
         if self.last_device_state_changed_event_args is None:

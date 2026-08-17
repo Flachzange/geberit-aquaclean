@@ -8,27 +8,27 @@ Planned features, improvements, and known bugs to fix.
 
 ### Fix: SPL parameter mislabeling (LidOffset / ShowerArmOffset)
 
-**Prerequisite resolved (2026-06-26, nRF52840 capture)**: The iOS app sends SPL
-`[0,1,2,3,4,5,6,7,8,9,10,11]` — indices 12 and 13 are **not** in the iOS SPL list.
-LidOffset/ShowerArmOffset are at indices 104/105 (unconfirmed queryability). The fix
-below is unblocked.
+**Still open; separate from the GetFilterStatus fix.**
 
-**Root cause**: `SPL_PARAMS_MERA_COMFORT = [0,1,2,3,4,5,6,7,12,13]` is queried correctly,
-but the bridge mislabels the results:
-- `data_array[8]` (SPL index 12) = `AC_STATUS_UNPOSTED_SHOWER_CYCLES` — labeled `LidOffsetPosition`
-- `data_array[9]` (SPL index 13) = `AC_STATUS_DAYS_UNTIL_NEXT_DESCALE` — labeled `ShowerArmOffsetPosition`
+Protocol mapping identifies:
+- SPL 12 = `AC_STATUS_UNPOSTED_SHOWER_CYCLES`
+- SPL 13 = `AC_STATUS_DAYS_UNTIL_NEXT_DESCALE`
+- real LidOffset/ShowerArmOffset = SPL 104/105 (queryability still unconfirmed)
 
-The real `LidOffsetPosition`/`ShowerArmOffsetPosition` are at SPL indices 104/105 (DpIds 65700/65701),
-not currently queried. The correctly-labeled data is already available via `GetStatisticsDescale` (proc 0x51).
+The bridge currently retains the historical external fields
+`LidOffsetPosition` / `ShowerArmOffsetPosition` for compatibility, while the
+internal second safe batch is named `SPL_PARAMS_MERA_COMFORT_AUX`.
 
-**Fix steps** (after v2.14.1 OTA capture confirms):
-1. Remove indices 12 and 13 from `SPL_PARAMS_MERA_COMFORT` → back to `[0,1,2,3,4,5,6,7]`
-   (GetStatisticsDescale already provides the same data with correct names)
-2. Remove `LidOffsetPosition`/`ShowerArmOffsetPosition` from `DeviceStateChangedEventArgs` (`IAquaCleanClient.py`)
-3. Remove from `device_state` SPL update path (`main.py` ~lines 2970–2981)
-4. Remove from coordinator SPL result mapping (`coordinator.py` ~lines 592–619)
-5. Remove two HACS sensors with wrong data: `lid_offset_position`, `shower_arm_offset_position` (`sensor.py`)
-6. Update bridge comments in `AquaCleanClient.py` and `coordinator.py`
+Do not confuse this semantic issue with the RS30.0 TS206 filter-status bug:
+the latter is solved operationally by splitting GetSPL into `[0..7]` and
+`[12,13]`, keeping meaningful request data out of CONS.
+
+**Future semantic cleanup:**
+1. Decide whether SPL 12/13 should be removed from the live-state poll entirely
+   because equivalent descale statistics are already exposed correctly.
+2. Confirm queryability and semantics of SPL 104/105 on the target Mera firmware.
+3. Only then migrate/remove the legacy external offset fields across MQTT, REST,
+   HACS/coordinator and FHEM-facing consumers, with an explicit compatibility plan.
 
 ---
 
@@ -91,7 +91,7 @@ operate at the application (DpId) layer: decrypt, re-encrypt, forward.
 
 ### Add SPL indices 14–22 to bridge
 
-All confirmed safe from firmware analysis (node 0x01 dispatcher handles 0–21) and iOS app DpId.cs.
+Semantics are confirmed from firmware/app analysis, but RS30.0 TS206 production code must keep each GetSPL batch at <=8 meaningful IDs to avoid the documented continuation/0x59 interoperability bug.
 Indices 16, 17, 20, 21 are not yet exposed anywhere — add to bridge and expose via REST/MQTT/HACS.
 
 | Index | Name | Bridge currently provides via |
