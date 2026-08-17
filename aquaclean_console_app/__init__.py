@@ -6,7 +6,8 @@ Test-only shim. It performs:
   disconnect_ble_only()
   immediate reconnect
   #3 GetFilterStatus in the new BLE session
-  #4 GetFilterStatus immediately after the first later GetSPL call
+  #4a GetFilterStatus immediately before the first later GetSPL call
+  #4b GetFilterStatus immediately after that same GetSPL call
 
 Production bridge flow in main.py remains unchanged.
 """
@@ -114,30 +115,57 @@ async def _diag_disconnect_ble_only(self):
 
 
 async def _diag_get_spl(self, *args, **kwargs):
-    result = await _orig_get_spl(self, *args, **kwargs)
-
-    # After #3 proved that a bare disconnect/reconnect is harmless, the first
-    # later SPL call is the next isolated candidate. Probe 0x59 immediately after
-    # that SPL response, while the same BLE session is still open.
+    # After #3 proved that a bare disconnect/reconnect is harmless, inspect the
+    # first later SPL in a fresh poll session from both sides. This separates
+    # "0x59 was already dead before the SPL" from "this SPL transition kills it".
     ready = getattr(self, "_diag_filterstatus_post_disconnect_success", False)
     already_done = getattr(self, "_diag_filterstatus_fourth_done", False)
-    if ready and not already_done:
-        self._diag_filterstatus_fourth_done = True
+
+    if not ready or already_done:
+        return await _orig_get_spl(self, *args, **kwargs)
+
+    # Mark before probing so this diagnostic can never repeat in the same process.
+    self._diag_filterstatus_fourth_done = True
+
+    _diag_logger.info(
+        "DIAG GetFilterStatus #4a: first later poll session reached SPL; "
+        "testing 0x59 BEFORE SPL"
+    )
+    try:
+        await _orig_get_filter_status(self)
+        self._diag_filterstatus_fourth_pre_success = True
         _diag_logger.info(
-            "DIAG GetFilterStatus #4: first SPL after successful #3 completed; "
-            "testing 0x59 before BLE disconnect"
+            "DIAG GetFilterStatus #4a: SUCCESS — 0x59 works before later SPL"
         )
-        try:
-            await _orig_get_filter_status(self)
-            self._diag_filterstatus_fourth_success = True
-            _diag_logger.info(
-                "DIAG GetFilterStatus #4: SUCCESS — 0x59 still works immediately after later SPL"
-            )
-        except _BLEPeripheralTimeoutError:
-            self._diag_filterstatus_fourth_success = False
-            _diag_logger.warning(
-                "DIAG GetFilterStatus #4: TIMEOUT — later SPL makes 0x59 stuck before BLE disconnect"
-            )
+    except _BLEPeripheralTimeoutError:
+        self._diag_filterstatus_fourth_pre_success = False
+        _diag_logger.warning(
+            "DIAG GetFilterStatus #4a: TIMEOUT — 0x59 was already stuck before later SPL"
+        )
+
+    result = await _orig_get_spl(self, *args, **kwargs)
+
+    if not self._diag_filterstatus_fourth_pre_success:
+        _diag_logger.warning(
+            "DIAG GetFilterStatus #4b: SKIPPED — pre-SPL probe already timed out; "
+            "post-SPL result would not isolate the SPL"
+        )
+        return result
+
+    _diag_logger.info(
+        "DIAG GetFilterStatus #4b: later SPL completed; testing 0x59 AFTER SPL"
+    )
+    try:
+        await _orig_get_filter_status(self)
+        self._diag_filterstatus_fourth_post_success = True
+        _diag_logger.info(
+            "DIAG GetFilterStatus #4b: SUCCESS — 0x59 survives later SPL when probed first"
+        )
+    except _BLEPeripheralTimeoutError:
+        self._diag_filterstatus_fourth_post_success = False
+        _diag_logger.warning(
+            "DIAG GetFilterStatus #4b: TIMEOUT — later SPL kills 0x59 despite successful pre-SPL probe"
+        )
 
     return result
 
