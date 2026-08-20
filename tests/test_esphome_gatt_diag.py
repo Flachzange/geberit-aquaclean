@@ -77,53 +77,6 @@ class _FailingDescriptorAPIClient:
 
 
 @pytest.mark.asyncio
-async def test_diag_reorders_real_notify_setup_to_a6_a5_a7_a8(caplog):
-    diag = _load_diag_module()
-
-    class _TrackingAPIClient:
-        def __init__(self):
-            self.notify_handles = []
-            self.descriptor_handles = []
-
-        async def bluetooth_gatt_get_services(self, address):
-            return _ServicesResponse()
-
-        async def bluetooth_gatt_start_notify(self, address, handle, callback):
-            self.notify_handles.append(handle)
-            return (lambda: None, lambda: None)
-
-        async def bluetooth_gatt_write_descriptor(self, address, handle, data):
-            self.descriptor_handles.append(handle)
-            return None
-
-    assert diag.install(_TrackingAPIClient) is True
-    api = _TrackingAPIClient()
-    address = int("38AB412A0D67", 16)
-
-    with caplog.at_level(logging.INFO):
-        response = await api.bluetooth_gatt_get_services(address)
-        service = response.services[0]
-        assert [char.handle for char in service.characteristics] == [0x13, 0x0F, 0x17, 0x1B]
-
-        # Mirror BluetoothLeConnector._list_services(): iterate the service in
-        # the order returned by ESPHome and complete each notify+CCCD setup.
-        for char in service.characteristics:
-            await api.bluetooth_gatt_start_notify(address, char.handle, lambda *_: None)
-            await api.bluetooth_gatt_write_descriptor(
-                address, char.descriptors[0].handle, b"\x01\x00"
-            )
-
-    assert api.notify_handles == [0x13, 0x0F, 0x17, 0x1B]
-    assert api.descriptor_handles == [0x14, 0x10, 0x18, 0x1C]
-    text = caplog.text
-    assert "stage=notify_order OK" in text
-    assert "experiment=a6_a5_a7_a8" in text
-    assert "order=A6,A5,A7,A8" in text
-    assert "inter_channel_settle" not in text
-    assert " SKIP " not in text
-
-
-@pytest.mark.asyncio
 async def test_diag_maps_a6_cccd_and_logs_combined_timing(caplog):
     diag = _load_diag_module()
     assert diag.install(_FakeAPIClient) is True

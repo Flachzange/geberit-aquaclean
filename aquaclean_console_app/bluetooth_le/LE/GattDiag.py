@@ -1,11 +1,8 @@
 """Temporary ESPHome GATT notification diagnostics.
 
 This module instruments the three aioesphomeapi operations involved in the
-AquaClean notification setup. Diagnostic experiment #4 changes exactly one
-variable: for the standard AquaClean GATT service it exposes the READ notify
-characteristics to the connector in A6 -> A5 -> A7 -> A8 order instead of the
-native A5 -> A6 -> A7 -> A8 order. Parameters, retries and timing are otherwise
-left untouched:
+AquaClean notification setup without changing their order, parameters, retry
+behaviour, or timing intentionally:
 
 * bluetooth_gatt_get_services()       -> records characteristic/CCCD handles
 * bluetooth_gatt_start_notify()       -> times notification registration
@@ -36,13 +33,6 @@ _READ_LABELS = {
     "3334429d-90f3-4c41-a02d-5cb3a73e0000": "READ_2(A7)",
     "3334429d-90f3-4c41-a02d-5cb3a83e0000": "READ_3(A8)",
 }
-_EXPERIMENT_NOTIFY_ORDER = (
-    "3334429d-90f3-4c41-a02d-5cb3a63e0000",  # A6 first
-    "3334429d-90f3-4c41-a02d-5cb3a53e0000",  # then A5
-    "3334429d-90f3-4c41-a02d-5cb3a73e0000",  # A7
-    "3334429d-90f3-4c41-a02d-5cb3a83e0000",  # A8
-)
-_EXPERIMENT_RANK = {uuid: rank for rank, uuid in enumerate(_EXPERIMENT_NOTIFY_ORDER)}
 
 
 def _elapsed_ms(start: float) -> float:
@@ -89,60 +79,6 @@ def _cccd_meta(api: Any, cccd_handle: Any) -> tuple[Any, str, str]:
     if meta is None:
         return (None, "unknown", "unknown")
     return meta
-
-
-def _reorder_notify_characteristics_for_experiment(response: Any) -> bool:
-    """Expose standard AquaClean READ characteristics as A6, A5, A7, A8.
-
-    Only the relative order of the four known READ characteristics is changed;
-    every other characteristic remains at its original list position. This keeps
-    the experiment limited to notification setup order while allowing the normal
-    connector/ESPHomeAPIClient code to perform all real start-notify and CCCD
-    operations (including its normal unsubscribe bookkeeping).
-    """
-    changed = False
-    for service in getattr(response, "services", ()) or ():
-        if str(getattr(service, "uuid", "")).lower() != _SERVICE_UUID:
-            continue
-
-        target = getattr(service, "characteristics", None)
-        if target is None:
-            continue
-        chars = list(target)
-        read_positions = [
-            idx
-            for idx, char in enumerate(chars)
-            if str(getattr(char, "uuid", "")).lower() in _EXPERIMENT_RANK
-        ]
-        if len(read_positions) < 2:
-            continue
-
-        reads = [chars[idx] for idx in read_positions]
-        ordered_reads = sorted(
-            reads,
-            key=lambda char: _EXPERIMENT_RANK[str(getattr(char, "uuid", "")).lower()],
-        )
-        if reads == ordered_reads:
-            continue
-
-        reordered = list(chars)
-        for idx, char in zip(read_positions, ordered_reads):
-            reordered[idx] = char
-
-        try:
-            target[:] = reordered
-        except Exception:
-            try:
-                del target[:]
-                target.extend(reordered)
-            except Exception:
-                logger.warning(
-                    "[GATT-DIAG] stage=notify_order SKIP reason=characteristics_not_mutable experiment=a6_a5_a7_a8"
-                )
-                continue
-        changed = True
-
-    return changed
 
 
 def _extract_geberit_map(response: Any) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[int, str, str]], str]:
@@ -212,7 +148,6 @@ def install(api_client_cls=None) -> bool:
             raise
 
         session = next(_SESSION_SEQ)
-        reordered = _reorder_notify_characteristics_for_experiment(response)
         chars, cccds, plan = _extract_geberit_map(response)
         setattr(self, "_aquaclean_gatt_diag_session", session)
         setattr(self, "_aquaclean_gatt_diag_chars", chars)
@@ -226,12 +161,6 @@ def install(api_client_cls=None) -> bool:
             address,
             _elapsed_ms(started),
             plan,
-        )
-        logger.info(
-            "[GATT-DIAG] session=%s stage=notify_order %s address=%s experiment=a6_a5_a7_a8 order=A6,A5,A7,A8",
-            session,
-            "OK" if reordered else "UNCHANGED",
-            address,
         )
         return response
 
