@@ -15,6 +15,7 @@ the intermittent ESP_GATT_ERROR (133) has been isolated.
 from __future__ import annotations
 
 import functools
+import asyncio
 import itertools
 import logging
 import time
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 _SERVICE_UUID = "3334429d-90f3-4c41-a02d-5cb3a03e0000"
 _CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 _SESSION_SEQ = itertools.count(1)
+_PRE_NOTIFY_SETTLE_S = 0.250
 _INSTALLED_ATTR = "_aquaclean_gatt_diag_installed"
 
 _READ_LABELS = {
@@ -154,6 +156,7 @@ def install(api_client_cls=None) -> bool:
         setattr(self, "_aquaclean_gatt_diag_cccd", cccds)
         setattr(self, "_aquaclean_gatt_diag_notify_ms", {})
         setattr(self, "_aquaclean_gatt_diag_notify_end", {})
+        setattr(self, "_aquaclean_gatt_diag_pre_notify_settled", False)
 
         logger.info(
             "[GATT-DIAG] session=%s stage=service_discovery OK address=%s elapsed_ms=%.1f plan=%s",
@@ -169,6 +172,13 @@ def install(api_client_cls=None) -> bool:
         address = _arg(args, kwargs, 0, "address")
         handle = _arg(args, kwargs, 1, "handle")
         uuid, role = _char_meta(self, handle)
+        if uuid in _READ_LABELS and not getattr(self, "_aquaclean_gatt_diag_pre_notify_settled", False):
+            setattr(self, "_aquaclean_gatt_diag_pre_notify_settled", True)
+            settle_started = time.perf_counter()
+            logger.info("[GATT-DIAG] session=%s stage=pre_notify_settle BEGIN address=%s delay_ms=250", _session(self), address)
+            await asyncio.sleep(_PRE_NOTIFY_SETTLE_S)
+            logger.info("[GATT-DIAG] session=%s stage=pre_notify_settle OK address=%s elapsed_ms=%.1f", _session(self), address, _elapsed_ms(settle_started))
+
         started = time.perf_counter()
         logger.debug(
             "[GATT-DIAG] session=%s stage=notify_register BEGIN address=%s role=%s char=%s uuid=%s",
