@@ -111,3 +111,20 @@ def test_common_setting_ranges_are_correct():
         6: (0, 1),
         7: (0, 1),
     }
+
+def test_profile_setting_ranges_are_correct():
+    """Check all profile values, especially ID 13 (dryer spray intensity)."""
+    assert _main_constant("_PROFILE_SETTING_RANGES") == {
+        0: (0, 1),
+        1: (0, 1),
+        2: (0, 4),
+        3: (0, 4),
+        4: (0, 4),
+        5: (0, 4),
+        6: (0, 5),
+        7: (0, 5),
+        8: (0, 5),
+        9: (0, 1),
+        13: (0, 4),
+    }
+
