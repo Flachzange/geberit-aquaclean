@@ -82,22 +82,45 @@ CallClasses `0x53` / `0x54` are already migrated but not yet wired into any inte
 ## Layer 3 — `GetSystemParameterList` (SPL)
 
 Reads live device state. **NOT** DpIds — separate index space.
-`SPL_PARAMS_MERA_COMFORT` in `AquaCleanClient.py` defines the list sent.
 
-**Bridge current list**: `[0,1,2,3,4,5,6,7,12,13]` — 12 = UnpostedShowerCycles, 13 = DaysUntilNextDescale.
-⚠️ **Mislabeling bug**: the bridge currently labels these as `LidOffsetPosition`/`ShowerArmOffsetPosition` — that is wrong.
-See `docs/roadmap.md` → "Fix: SPL parameter mislabeling" for the fix TODO.
-**iOS app sends**: `[0,1,2,3,4,5,6,7,8,9,10,11]` — confirmed from nRF52840 capture 2026-06-26
-(HB2304EU298413, RS146.21 fw). Indices 8–11 return 0 on Mera Comfort; no `GetFilterStatus`
-corruption observed. Earlier OTA capture (2026-06-01) showing `[13,12,0..7]` conflicts with this
-and was likely misread or truncated — trust the nRF result.
-Indices 12/13 are NOT in the iOS SPL list; iOS gets UnpostedShowerCycles/DaysUntilNextDescale
-via `GetStatisticsDescale` instead.
-The real LidOffset/ShowerArmOffset are at SPL indices 104/105 — queryability unconfirmed.
+The bridge deliberately uses two Mera batches:
 
-**Indices 8, 9, 10 are device-variant specific** (return 0 on Mera Comfort) but querying them
-is safe — the earlier "permanently corrupts GetFilterStatus until power-cycle" claim is unverified
-and contradicted by the 2026-06-26 nRF capture. Do not rely on that warning.
+- `SPL_PARAMS_MERA_COMFORT_STATE = [0,1,2,3,4,5,6,7]`
+- `SPL_PARAMS_MERA_COMFORT_AUX = [12,13]`
+
+### RS30.0 TS206 interoperability rule — validated 2026-08-17
+
+On the tested Mera with RS30.0 TS206, a combined
+`[0,1,2,3,4,5,6,7,12,13]` GetSPL request completes and returns all requested
+values, but subsequently leaves `GetFilterStatus` (0x59) unresponsive until a
+WC power cycle.
+
+The same parameters requested as `[0..7]` followed by `[12,13]` preserve 0x59.
+Bridge production polling therefore keeps every GetSPL batch at **8 or fewer
+meaningful IDs**. Zero padding in the continuation area was safe in testing;
+meaningful/non-zero request content extending into CONS was the observed
+failure discriminator.
+
+This is an empirical rule for RS30.0 TS206 and the tested bridge transport,
+not a universal statement about all AquaClean firmware. See
+`docs/developer/getfilterstatus-getspl-ordering.md`.
+
+### Parameter semantics and iOS comparison
+
+SPL 12 = `UnpostedShowerCycles`; SPL 13 = `DaysUntilNextDescale`.
+The bridge still exposes those two values through legacy fields named
+`LidOffsetPosition` / `ShowerArmOffsetPosition`; that semantic cleanup is
+tracked separately in `docs/roadmap.md`.
+
+A newer nRF52840 capture (2026-06-26, HB2304EU298413, RS146.21) shows the iOS
+app sending `[0,1,2,3,4,5,6,7,8,9,10,11]` without observed 0x59 corruption.
+That different-firmware capture is useful protocol evidence but does not
+invalidate the reproduced RS30.0 TS206 bridge behavior.
+
+Indices 8–10 are device-variant-specific. The RS30.0 tests show that a
+non-zero ninth request byte (for example index 8 as the ninth ID) can trigger
+the continuation-related 0x59 failure; this does **not** prove that index 8
+itself is semantically invalid when queried in a safe-sized batch.
 
 ### SPL parameter index definitions
 
@@ -116,7 +139,7 @@ unconfirmed for those — check v2.14.1 OTA capture.
 | 5 | DurationDescaling | all |
 | 6 | LastError | all |
 | 7 | StateService | all |
-| 8 | StateSprayCalibration | ⚠️ not for Mera Comfort — corrupts GetFilterStatus |
+| 8 | StateSprayCalibration | device-variant-specific; returned 0 in captured Mera session; ninth-ID use can hit RS30 continuation bug |
 | 9 | StateOrientationLight | ⚠️ AcSela only — not for Mera Comfort |
 | 10 | StateDraining | ⚠️ AcCama/AcCamaTestset only — not for Mera Comfort |
 | 11 | EndiannessCheck | all (DpId 65607) |
@@ -161,14 +184,15 @@ on Mera Comfort. `AC_STATUS_USER_PRESENT` (SPL index 0) = seat sensor only.
 
 **`AC_STATUS_ORIENTATION_LIGHT` (= 65605, SPL index 9):**
 - AcSela only. Index 9 always returns 0 on HB2304EU298413 — orientation light state is
-  invisible over BLE on Mera Comfort (confirmed from BLE log analysis).
-- Not in `SPL_PARAMS_MERA_COMFORT` — intentionally excluded.
-- **DO NOT probe index 9 on Mera Comfort** — same danger as indices 8 and 10:
-  permanently corrupts `GetFilterStatus` state until power-cycle.
+  invisible over BLE on that captured Mera Comfort session.
+- It is not part of the Mera production poll.
+- The former claim that index 9 itself permanently corrupts `GetFilterStatus` is
+  superseded. The reproduced RS30.0 TS206 issue is tied to meaningful continuation
+  content in oversized GetSPL batches, not to index 9 specifically.
 
-To probe on an **AcSela** (not Mera Comfort):
+To probe on an **AcSela**:
 ```bash
-# GetSystemParameterList for index 9 only — AcSela only, DO NOT run on Mera Comfort
+# GetSystemParameterList for index 9 only — AcSela
 /Users/jens/venv/bin/python tools/geberit-ble-probe.py \
   --proc 0x0D \
   --args 01 09 00 00 00 00 00 00 00 00 00 00 00
@@ -212,7 +236,7 @@ From `aquaclean-SILLY.log`:
 - `0x53` / `0x54` — GetStoredProfileSetting / SetStoredProfileSetting
 - `0x55` — `GetDeviceRegistrationLevel` (RpcNumberGet=85 in AcDataPointDefinitionFactory); response = 0/1/2 ("Not registered" / "Registered as private device" / "Registered as public device"). App reads this at init to customise UI — **not used by the toilet device itself**. Bridge does NOT need to call it.
 - `0x56` — `SetDeviceRegistrationLevel` (RpcNumberSet=86); valid range 0–2 (the "value 257" in earlier notes was a misreading)
-- `0x59` — GetFilterStatus. iOS onboarding queries this twice in sequence: first IDs [0–7] (returns empty — probe), then IDs [0–11] (returns days remaining, reset count, last reset date). Bridge uses IDs [0–7] only.
+- `0x59` — GetFilterStatus. Bridge request IDs are `[0,1,2,3,7,8,9,10]`; records 7–10 provide days remaining, last reset, next change and reset count. Keep the request shape separate from the GetSPL continuation issue described above.
 - `0x81` — GetSOCApplicationVersions
 - `0x82` — GetDeviceIdentification
 - `0x86` — GetDeviceInitialOperationDate
