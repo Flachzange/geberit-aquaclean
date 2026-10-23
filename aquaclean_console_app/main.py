@@ -609,6 +609,11 @@ class ServiceMode:
             "wifi_rssi": None,               # ESP32 WiFi signal strength in dBm
             "free_heap": None,               # ESP32 free heap in bytes
             "max_free_block": None,          # ESP32 max contiguous free block in bytes
+            "min_free_heap": None,            # Minimum free heap since last boot in bytes
+            "uptime": None,                   # ESP32 uptime in seconds
+            "reset_reason": None,             # Last ESP32 reset reason
+            "bssid": None,                    # WiFi access point BSSID
+            "diagnostics_updated_at": None,   # UTC time of last successful sensor snapshot
         }
         # MQTT proxy errors are events, not a refreshed telemetry value. Keep
         # one published error per continuous outage; E0000 rearms reporting.
@@ -1063,7 +1068,7 @@ class ServiceMode:
         if self.on_state_updated:
             await self.on_state_updated(self.device_state.copy())
 
-    async def _update_esphome_proxy_state(self, connected=None, name=None, error=None, error_code=None, error_hint=None, wifi_rssi=None, free_heap=None, max_free_block=None):
+    async def _update_esphome_proxy_state(self, connected=None, name=None, error=None, error_code=None, error_hint=None, wifi_rssi=None, free_heap=None, max_free_block=None, min_free_heap=None, uptime=None, reset_reason=None, bssid=None, diagnostics_updated_at=None):
         """Update ESPHome proxy state and publish to MQTT."""
         if connected is not None:
             self.esphome_proxy_state["connected"] = connected
@@ -1083,6 +1088,16 @@ class ServiceMode:
             self.esphome_proxy_state["free_heap"] = free_heap
         if max_free_block is not None:
             self.esphome_proxy_state["max_free_block"] = max_free_block
+        if min_free_heap is not None:
+            self.esphome_proxy_state["min_free_heap"] = min_free_heap
+        if uptime is not None:
+            self.esphome_proxy_state["uptime"] = uptime
+        if reset_reason is not None:
+            self.esphome_proxy_state["reset_reason"] = reset_reason
+        if bssid is not None:
+            self.esphome_proxy_state["bssid"] = bssid
+        if diagnostics_updated_at is not None:
+            self.esphome_proxy_state["diagnostics_updated_at"] = diagnostics_updated_at
         await self._publish_esphome_proxy_status()
         # Broadcast state change to SSE clients (webapp)
         if self.on_state_updated:
@@ -1099,6 +1114,11 @@ class ServiceMode:
                 "esphome_proxy_wifi_rssi": self.esphome_proxy_state.get("wifi_rssi"),
                 "esphome_proxy_free_heap": self.esphome_proxy_state.get("free_heap"),
                 "esphome_proxy_max_free_block": self.esphome_proxy_state.get("max_free_block"),
+                "esphome_proxy_min_free_heap": self.esphome_proxy_state.get("min_free_heap"),
+                "esphome_proxy_uptime": self.esphome_proxy_state.get("uptime"),
+                "esphome_proxy_reset_reason": self.esphome_proxy_state.get("reset_reason"),
+                "esphome_proxy_bssid": self.esphome_proxy_state.get("bssid"),
+                "esphome_proxy_diagnostics_updated_at": self.esphome_proxy_state.get("diagnostics_updated_at"),
             })
             await self.on_state_updated(state)
 
@@ -1168,6 +1188,19 @@ class ServiceMode:
                 f"{topic}/esphomeProxy/maxFreeBlock",
                 str(max_free_block)
             )
+        # Missing optional sensors are not published (no fabricated zero values).
+        for key, suffix in (
+            ("min_free_heap", "minFreeHeap"),
+            ("uptime", "uptime"),
+            ("reset_reason", "resetReason"),
+            ("bssid", "bssid"),
+            ("diagnostics_updated_at", "diagnosticsUpdatedAt"),
+        ):
+            value = self.esphome_proxy_state.get(key)
+            if value is not None:
+                await self.mqtt_service.send_data_async(
+                    f"{topic}/esphomeProxy/{suffix}", str(value)
+                )
 
     async def _publish_esphome_proxy_discovery(self):
         """Publish Home Assistant MQTT discovery for ESPHome proxy entities."""
@@ -1654,6 +1687,7 @@ class ApiMode:
         self._esphome_watchdog_online: bool | None = None  # independent API status
         self._esphome_api_ready     = asyncio.Event()  # gate for background polling
         self._esphome_recovered_pending = False  # wake a poll even during its 30s sleep
+        self._next_esphome_diagnostics_at = 0.0  # 30s telemetry, independent of BLE
         self._firmware_version_ready = asyncio.Event()  # set once firmware_versions is populated
         self._esphome_connector: "BluetoothLeConnector | None" = None  # Persistent connector (esphome_api_connection=persistent)
         self._esphome_client = None  # Paired client — created once so data_received_handlers don't accumulate
@@ -2569,6 +2603,22 @@ class ApiMode:
                 raise
             else:
                 await self._set_esphome_api_health(True)
+                # Sample optional proxy sensors through this same verified API
+                # connection. Do not couple diagnostics to a successful BLE poll.
+                if time.monotonic() >= self._next_esphome_diagnostics_at:
+                    self._next_esphome_diagnostics_at = time.monotonic() + 30.0
+                    await connector._read_esphome_diagnostics_async()
+                    if connector.esphome_diagnostics_timestamp is not None:
+                        await self.service._update_esphome_proxy_state(
+                            wifi_rssi=connector.esphome_wifi_rssi,
+                            free_heap=connector.esphome_free_heap,
+                            max_free_block=connector.esphome_max_free_block,
+                            min_free_heap=connector.esphome_min_free_heap,
+                            uptime=connector.esphome_uptime,
+                            reset_reason=connector.esphome_reset_reason,
+                            bssid=connector.esphome_bssid,
+                            diagnostics_updated_at=connector.esphome_diagnostics_timestamp,
+                        )
             finally:
                 if not shared:
                     await connector.disconnect()
