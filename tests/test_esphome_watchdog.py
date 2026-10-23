@@ -9,6 +9,7 @@ import ast
 import asyncio
 import logging
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -63,11 +64,17 @@ class FakeConnector:
         self._ensure_esphome_api_connected = AsyncMock(return_value=self._esphome_api)
         self.verify_esphome_api = AsyncMock()
         self.disconnect = AsyncMock()
+        self._read_esphome_diagnostics_async = AsyncMock()
+        self.esphome_diagnostics_timestamp = None
+        for field in ("wifi_rssi", "free_heap", "max_free_block", "min_free_heap",
+                      "uptime", "reset_reason", "bssid"):
+            setattr(self, "esphome_" + field, None)
         self.__class__.instances.append(self)
 
 
 api_ns = {
     "asyncio": asyncio,
+    "time": time,
     "logger": logger,
     "ESPHomeConnectionError": ESPHomeConnectionError,
     "BluetoothLeConnector": FakeConnector,
@@ -200,6 +207,7 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
         mode._poll_wakeup = asyncio.Event()
         mode._esphome_api_ready = asyncio.Event()
         mode._esphome_recovered_pending = False
+        mode._next_esphome_diagnostics_at = 0.0
         mode._esphome_watchdog_online = None
         mode.service = types.SimpleNamespace(
             mqttConfig={"topic": "Geberit/AquaClean"},
