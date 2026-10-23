@@ -155,7 +155,7 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(topics[prefix + "uptime"], "125")
         self.assertEqual(topics[prefix + "minFreeHeap"], "120000")
 
-    def test_sampled_from_watchdog_not_ble_poll(self):
+    def test_watchdog_and_legacy_ble_paths_collect_diagnostics(self):
         mode_src = (ROOT / "aquaclean_console_app/main.py").read_text()
         ble_src = (ROOT / "aquaclean_console_app/bluetooth_le/LE/BluetoothLeConnector.py").read_text()
         watchdog = mode_src[
@@ -167,7 +167,7 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
             ble_src.index("    async def ", ble_src.index("    async def _connect_via_esphome(") + 1)
         ]
         self.assertIn("await connector._read_esphome_diagnostics_async()", watchdog)
-        self.assertNotIn("_read_esphome_diagnostics_async", ble_connection)
+        self.assertIn("await self._read_esphome_diagnostics_async()", ble_connection)
 
 
 if __name__ == "__main__":
