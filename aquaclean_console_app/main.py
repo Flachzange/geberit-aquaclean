@@ -4127,6 +4127,66 @@ def get_ha_discovery_configs(topic_prefix: str) -> list:
                 "device": DEVICE_PROXY,
             },
         },
+        {
+            "topic": f"{HA}/sensor/geberit_aquaclean/esphome_uptime/config",
+            "payload": {
+                "name": "Uptime",
+                "unique_id": "geberit_aquaclean_esphome_uptime",
+                "state_topic": f"{t}/esphomeProxy/uptime",
+                "unit_of_measurement": "s",
+                "device_class": "duration",
+                "state_class": "measurement",
+                "icon": "mdi:clock-outline",
+                "entity_category": "diagnostic",
+                "device": DEVICE_PROXY,
+            },
+        },
+        {
+            "topic": f"{HA}/sensor/geberit_aquaclean/esphome_reset_reason/config",
+            "payload": {
+                "name": "Reset Reason",
+                "unique_id": "geberit_aquaclean_esphome_reset_reason",
+                "state_topic": f"{t}/esphomeProxy/resetReason",
+                "icon": "mdi:restart",
+                "entity_category": "diagnostic",
+                "device": DEVICE_PROXY,
+            },
+        },
+        {
+            "topic": f"{HA}/sensor/geberit_aquaclean/esphome_bssid/config",
+            "payload": {
+                "name": "Connected BSSID",
+                "unique_id": "geberit_aquaclean_esphome_bssid",
+                "state_topic": f"{t}/esphomeProxy/bssid",
+                "icon": "mdi:access-point-network",
+                "entity_category": "diagnostic",
+                "device": DEVICE_PROXY,
+            },
+        },
+        {
+            "topic": f"{HA}/sensor/geberit_aquaclean/esphome_min_free_heap/config",
+            "payload": {
+                "name": "Min Free Heap",
+                "unique_id": "geberit_aquaclean_esphome_min_free_heap",
+                "state_topic": f"{t}/esphomeProxy/minFreeHeap",
+                "unit_of_measurement": "B",
+                "state_class": "measurement",
+                "icon": "mdi:memory",
+                "entity_category": "diagnostic",
+                "device": DEVICE_PROXY,
+            },
+        },
+        {
+            "topic": f"{HA}/sensor/geberit_aquaclean/esphome_diagnostics_updated_at/config",
+            "payload": {
+                "name": "Diagnostics Last Update",
+                "unique_id": "geberit_aquaclean_esphome_diagnostics_updated_at",
+                "state_topic": f"{t}/esphomeProxy/diagnosticsUpdatedAt",
+                "icon": "mdi:clock-check-outline",
+                "entity_category": "diagnostic",
+                "device": DEVICE_PROXY,
+            },
+        },
     ]
 
 
