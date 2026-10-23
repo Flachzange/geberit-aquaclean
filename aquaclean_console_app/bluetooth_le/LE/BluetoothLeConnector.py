@@ -343,6 +343,7 @@ class BluetoothLeConnector(IBluetoothLeConnector):
         self._esphome_api = api
         self._esphome_diagnostic_keys = None  # Refresh ESPHome entity keys after reconnect
         self._esphome_diagnostics_subscribed = False
+        self.esphome_diagnostics_timestamp = None  # Old API readings are no longer fresh
         self.esphome_proxy_connected = True
         self.last_esphome_api_ms = int((time.perf_counter() - t0) * 1000)
         logger.debug(f"ESP32 proxy connected: {self.esphome_proxy_name} ({self.last_esphome_api_ms} ms)")
