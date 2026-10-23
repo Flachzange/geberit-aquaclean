@@ -44,15 +44,16 @@ class FakeAPI:
                            for k, oid in entries], [])
         )
         self.states = states
-        self.unsubscribed = False
+        self.subscribe_calls = 0
+        self.callback = None
 
     def subscribe_states(self, callback):
+        # Actual aioesphomeapi APIClient.subscribe_states returns None.
+        self.subscribe_calls += 1
+        self.callback = callback
         for k, value in self.states.items():
             callback(types.SimpleNamespace(key=k, state=value))
-
-        def unsubscribe():
-            self.unsubscribed = True
-        return unsubscribe
+        return None
 
 
 class ConnectorTests(unittest.IsolatedAsyncioTestCase):
@@ -60,6 +61,7 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         result = Connector()
         result._esphome_api = api
         result._esphome_diagnostic_keys = None
+        result._esphome_diagnostics_subscribed = False
         result.esphome_diagnostics_timestamp = None
         for field in ("wifi_rssi", "free_heap", "max_free_block", "min_free_heap",
                       "uptime", "reset_reason", "bssid"):
@@ -91,9 +93,13 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connector.esphome_reset_reason, "SW_CPU_RESET")
         self.assertEqual(connector.esphome_bssid, "AA:BB:CC:DD:EE:FF")
         self.assertTrue(connector.esphome_diagnostics_timestamp.endswith("Z"))
-        self.assertTrue(api.unsubscribed)
+        self.assertEqual(api.subscribe_calls, 1)
         await connector._read_esphome_diagnostics_async()
         api.list_entities_services.assert_awaited_once()
+        self.assertEqual(api.subscribe_calls, 1)  # persistent API must not leak subscriptions
+        # Live updates continue through the same state callback.
+        api.callback(types.SimpleNamespace(key=4, state=126.0))
+        self.assertEqual(connector.esphome_uptime, 126)
 
     async def test_missing_optional_sensors_do_not_fail(self):
         api = FakeAPI([(1, "aquaclean_proxy_uptime")], {1: 30.0})
