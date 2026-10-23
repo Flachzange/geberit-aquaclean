@@ -504,8 +504,10 @@ class BluetoothLeConnector(IBluetoothLeConnector):
         # that an interrupted inter-VLAN connection has recovered.
         await self.verify_esphome_api(api)
 
-        # Proxy diagnostics are sampled by the independent API watchdog,
-        # not here, to avoid adding latency to every BLE poll.
+        # Keep telemetry available in legacy service mode as well. API mode
+        # also samples independently via the watchdog when BLE is unavailable.
+        await self._read_esphome_diagnostics_async()
+
         t_ble = time.perf_counter()  # BLE timing starts after ESP32 API is ready
 
         mac_int = int(device_id.replace(":", ""), 16)
