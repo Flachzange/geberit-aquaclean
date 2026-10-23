@@ -831,6 +831,11 @@ class ServiceMode:
                         wifi_rssi=bluetooth_connector.esphome_wifi_rssi,
                         free_heap=bluetooth_connector.esphome_free_heap,
                         max_free_block=bluetooth_connector.esphome_max_free_block,
+                        min_free_heap=bluetooth_connector.esphome_min_free_heap,
+                        uptime=bluetooth_connector.esphome_uptime,
+                        reset_reason=bluetooth_connector.esphome_reset_reason,
+                        bssid=bluetooth_connector.esphome_bssid,
+                        diagnostics_updated_at=bluetooth_connector.esphome_diagnostics_timestamp,
                     )
 
                 # Record when polling starts so clients can compute a
@@ -2750,6 +2755,11 @@ class ApiMode:
                     wifi_rssi=connector.esphome_wifi_rssi,
                     free_heap=connector.esphome_free_heap,
                     max_free_block=connector.esphome_max_free_block,
+                    min_free_heap=connector.esphome_min_free_heap,
+                    uptime=connector.esphome_uptime,
+                    reset_reason=connector.esphome_reset_reason,
+                    bssid=connector.esphome_bssid,
+                    diagnostics_updated_at=connector.esphome_diagnostics_timestamp,
                 )
             await self.service.mqtt_service.send_data_async(
                 f"{topic}/centralDevice/timings",
