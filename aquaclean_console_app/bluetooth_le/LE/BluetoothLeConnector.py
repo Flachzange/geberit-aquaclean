@@ -95,6 +95,7 @@ class BluetoothLeConnector(IBluetoothLeConnector):
         self.esphome_bssid: str | None = None         # Connected WiFi access point BSSID
         self.esphome_diagnostics_timestamp: str | None = None  # UTC time of last fresh reading
         self._esphome_diagnostic_keys: dict[int, str] | None = None
+        self._esphome_diagnostics_subscribed: bool = False  # subscribe_states returns None; one subscription per API connection
         self._hass = hass  # Home Assistant instance (HACS integration only); None = standalone bridge
         self._subscribed_characteristics: list = []  # BleakGATTCharacteristic objects registered via start_notify()
         self.ble_dis_info: dict | None = None  # BLE Device Information Service data (0x180a), read after connect
@@ -341,21 +342,23 @@ class BluetoothLeConnector(IBluetoothLeConnector):
 
         self._esphome_api = api
         self._esphome_diagnostic_keys = None  # Refresh ESPHome entity keys after reconnect
+        self._esphome_diagnostics_subscribed = False
         self.esphome_proxy_connected = True
         self.last_esphome_api_ms = int((time.perf_counter() - t0) * 1000)
         logger.debug(f"ESP32 proxy connected: {self.esphome_proxy_name} ({self.last_esphome_api_ms} ms)")
         return api
 
     async def _read_esphome_diagnostics_async(self) -> None:
-        """Read optional ESPHome proxy diagnostic sensors over the existing API.
+        """Subscribe once to optional ESPHome diagnostics on the existing API.
 
-        Entity IDs are matched by their explicit object_id suffix rather than
-        partial matches ('heap' could otherwise select Min Free Heap in place
-        of Free Heap). Missing sensors are optional. A short-lived state
-        subscription collects an initial snapshot without touching BLE.
+        aioesphomeapi.APIClient.subscribe_states() returns None, not an
+        unsubscribe callable. State callbacks live until the API connection
+        closes. A persistent connection must subscribe only once to avoid
+        accumulating duplicate callbacks. Subsequent reads use cached values
+        updated asynchronously by the same subscription.
         """
         api = self._esphome_api
-        if api is None:
+        if api is None or self._esphome_diagnostics_subscribed:
             return
         try:
             if self._esphome_diagnostic_keys is None:
@@ -384,49 +387,57 @@ class BluetoothLeConnector(IBluetoothLeConnector):
 
             keys = self._esphome_diagnostic_keys
             if not keys:
+                logger.debug("No matching ESPHome diagnostic entities found")
                 return
-            captured = {}
-
-            def on_state(state):
-                key = getattr(state, "key", None)
-                if key in keys and key not in captured:
-                    value = getattr(state, "state", None)
-                    if value is not None:
-                        captured[key] = value
-                        if len(captured) >= len(keys):
-                            received.set()
 
             received = asyncio.Event()
-            unsubscribe = api.subscribe_states(on_state)
-            try:
-                await asyncio.wait_for(received.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                logger.debug("ESPHome diagnostics: received %s/%s sensors", len(captured), len(keys))
-            finally:
-                unsubscribe()
+            received_keys: set[int] = set()
 
-            if not captured:
-                return
-            for key, value in captured.items():
+            def on_state(state) -> None:
+                key = getattr(state, "key", None)
+                if key not in keys:
+                    return
+                value = getattr(state, "state", None)
+                if value is None:
+                    return
                 field = keys[key]
                 try:
                     if field in ("reset_reason", "bssid"):
                         setattr(self, "esphome_" + field, str(value))
                     elif field == "wifi_rssi":
                         parsed = float(value)
-                        if math.isfinite(parsed):
-                            self.esphome_wifi_rssi = round(parsed, 1)
+                        if not math.isfinite(parsed):
+                            return
+                        self.esphome_wifi_rssi = round(parsed, 1)
                     else:
                         parsed = float(value)
-                        if math.isfinite(parsed):
-                            setattr(self, "esphome_" + field, int(parsed))
+                        if not math.isfinite(parsed):
+                            return
+                        setattr(self, "esphome_" + field, int(parsed))
                 except (ValueError, TypeError, OverflowError):
                     logger.debug("Ignoring invalid ESPHome %s diagnostic: %r", field, value)
-            self.esphome_diagnostics_timestamp = (
-                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            )
+                    return
+
+                self.esphome_diagnostics_timestamp = (
+                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                )
+                received_keys.add(key)
+                if len(received_keys) >= len(keys):
+                    received.set()
+
+            # This returns None. The callback remains registered until the
+            # underlying API connection closes; do not call unsubscribe().
+            api.subscribe_states(on_state)
+            self._esphome_diagnostics_subscribed = True
+            try:
+                await asyncio.wait_for(received.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "ESPHome diagnostic initial state: received %s/%s entities",
+                    len(received_keys), len(keys),
+                )
         except Exception as exc:
-            logger.debug("Failed to read optional ESPHome diagnostics: %s", exc)
+            logger.debug("Failed to subscribe to optional ESPHome diagnostics: %s", exc)
 
     async def _read_esphome_wifi_rssi_async(self) -> None:
         """Compatibility wrapper for existing callers."""
@@ -443,6 +454,8 @@ class BluetoothLeConnector(IBluetoothLeConnector):
                 logger.debug("ESPHome stale advertisement unsubscribe: %s", exc)
             self._esphome_unsub_adv = None
         self._esphome_api = None
+        self._esphome_diagnostics_subscribed = False
+        self._esphome_diagnostic_keys = None
         self.esphome_proxy_connected = False
         try:
             close = api.disconnect()
