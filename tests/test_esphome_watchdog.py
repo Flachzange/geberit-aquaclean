@@ -314,6 +314,27 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(mode._esphome_watchdog_online, True)
         FakeConnector.instances[-1].disconnect.assert_awaited_once()
 
+    async def test_diagnostics_published_without_ble_poll(self):
+        mode = self.mode()
+
+        class SamplingConnector(FakeConnector):
+            def __init__(self, *args):
+                super().__init__(*args)
+                self.esphome_diagnostics_timestamp = "2026-10-23T08:00:00Z"
+                self.esphome_uptime = 123
+                self.esphome_bssid = "AA:BB:CC:DD:EE:FF"
+
+        old_connector = api_ns["BluetoothLeConnector"]
+        api_ns["BluetoothLeConnector"] = SamplingConnector
+        try:
+            await mode._probe_esphome_proxy()
+        finally:
+            api_ns["BluetoothLeConnector"] = old_connector
+        self.assertEqual(mode.service._update_esphome_proxy_state.await_count, 2)
+        diagnostics_call = mode.service._update_esphome_proxy_state.await_args.kwargs
+        self.assertEqual(diagnostics_call["uptime"], 123)
+        self.assertEqual(diagnostics_call["bssid"], "AA:BB:CC:DD:EE:FF")
+
     def test_polling_gate_and_resume_paths_exist(self):
         source = (ROOT / "aquaclean_console_app/main.py").read_text(encoding="utf-8")
         loop = source[source.index("    async def _polling_loop("):
