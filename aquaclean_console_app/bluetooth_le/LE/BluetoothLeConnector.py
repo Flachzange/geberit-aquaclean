@@ -1,6 +1,7 @@
 import asyncio
 import math
 import time
+from datetime import datetime, timezone
 from bleak import BleakClient, BleakScanner, BleakError
 from bleak.backends.scanner import AdvertisementData
 from bleak.backends.device import BLEDevice
@@ -88,9 +89,12 @@ class BluetoothLeConnector(IBluetoothLeConnector):
         self.esphome_wifi_rssi: float | None = None   # ESP32 WiFi signal strength (dBm)
         self.esphome_free_heap: int | None = None     # ESP32 free heap in bytes
         self.esphome_max_free_block: int | None = None  # ESP32 max contiguous free block in bytes
-        self._esphome_wifi_key: int | None = None     # aioesphomeapi entity key for wifi_signal sensor
-        self._esphome_free_heap_key: int | None = None       # aioesphomeapi entity key for free heap sensor
-        self._esphome_max_free_block_key: int | None = None  # aioesphomeapi entity key for max free block sensor
+        self.esphome_min_free_heap: int | None = None   # ESP32 lowest free heap since boot
+        self.esphome_uptime: int | None = None         # ESP32 uptime in seconds
+        self.esphome_reset_reason: str | None = None  # ESP32 last reset reason
+        self.esphome_bssid: str | None = None         # Connected WiFi access point BSSID
+        self.esphome_diagnostics_timestamp: str | None = None  # UTC time of last fresh reading
+        self._esphome_diagnostic_keys: dict[int, str] | None = None
         self._hass = hass  # Home Assistant instance (HACS integration only); None = standalone bridge
         self._subscribed_characteristics: list = []  # BleakGATTCharacteristic objects registered via start_notify()
         self.ble_dis_info: dict | None = None  # BLE Device Information Service data (0x180a), read after connect
@@ -336,110 +340,97 @@ class BluetoothLeConnector(IBluetoothLeConnector):
             self.esphome_proxy_name = "unknown"
 
         self._esphome_api = api
+        self._esphome_diagnostic_keys = None  # Refresh ESPHome entity keys after reconnect
         self.esphome_proxy_connected = True
         self.last_esphome_api_ms = int((time.perf_counter() - t0) * 1000)
         logger.debug(f"ESP32 proxy connected: {self.esphome_proxy_name} ({self.last_esphome_api_ms} ms)")
         return api
 
-    async def _read_esphome_wifi_rssi_async(self) -> None:
-        """Read ESP32 diagnostic sensor values via the native API.
+    async def _read_esphome_diagnostics_async(self) -> None:
+        """Read optional ESPHome proxy diagnostic sensors over the existing API.
 
-        Reads WiFi RSSI, Free Heap, and Max Free Block in a single subscribe_states() call.
-        Requires `platform: wifi_signal` and `platform: debug` in the ESPHome YAML.
-        Safe to call while API is connected but BLE is idle (before advertisement scan).
-        Silently skips sensors that are not configured or if the read times out.
+        Entity IDs are matched by their explicit object_id suffix rather than
+        partial matches ('heap' could otherwise select Min Free Heap in place
+        of Free Heap). Missing sensors are optional. A short-lived state
+        subscription collects an initial snapshot without touching BLE.
         """
         api = self._esphome_api
         if api is None:
             return
         try:
-            # Cache entity keys on first call to avoid list_entities_services() every poll.
-            if self._esphome_wifi_key is None or self._esphome_free_heap_key is None or self._esphome_max_free_block_key is None:
+            if self._esphome_diagnostic_keys is None:
                 entities, _ = await asyncio.wait_for(api.list_entities_services(), timeout=5.0)
+                keys = {}
+                for entity in entities:
+                    oid = str(getattr(entity, "object_id", "") or "").lower()
+                    field = None
+                    if oid.endswith("_wifi_rssi") or oid.endswith("_wifi_signal"):
+                        field = "wifi_rssi"
+                    elif oid.endswith("_min_free_heap"):
+                        field = "min_free_heap"
+                    elif oid.endswith("_free_heap"):
+                        field = "free_heap"
+                    elif oid.endswith("_max_free_block"):
+                        field = "max_free_block"
+                    elif oid.endswith("_uptime"):
+                        field = "uptime"
+                    elif oid.endswith("_reset_reason"):
+                        field = "reset_reason"
+                    elif oid.endswith("_connected_bssid") or oid.endswith("_bssid"):
+                        field = "bssid"
+                    if field is not None:
+                        keys[entity.key] = field
+                self._esphome_diagnostic_keys = keys
 
-                if self._esphome_wifi_key is None:
-                    self._esphome_wifi_key = next(
-                        (
-                            e.key for e in entities
-                            if getattr(e, 'unit_of_measurement', '') == 'dBm'
-                            and 'wifi' in getattr(e, 'object_id', '').lower()
-                        ),
-                        -1,  # sentinel: -1 = "not found", None = "not yet looked up"
-                    )
-                    if self._esphome_wifi_key == -1:
-                        logger.debug("No wifi_signal sensor on ESP32 (add platform: wifi_signal to ESPHome YAML)")
-
-                if self._esphome_free_heap_key is None:
-                    self._esphome_free_heap_key = next(
-                        (
-                            e.key for e in entities
-                            if 'heap' in getattr(e, 'object_id', '').lower()
-                        ),
-                        -1,
-                    )
-                    if self._esphome_free_heap_key == -1:
-                        logger.debug("No free heap sensor on ESP32 (add platform: debug with free: to ESPHome YAML)")
-
-                if self._esphome_max_free_block_key is None:
-                    self._esphome_max_free_block_key = next(
-                        (
-                            e.key for e in entities
-                            if 'block' in getattr(e, 'object_id', '').lower()
-                        ),
-                        -1,
-                    )
-                    if self._esphome_max_free_block_key == -1:
-                        logger.debug("No max free block sensor on ESP32 (add platform: debug with block: to ESPHome YAML)")
-
-            # Collect which keys we need to read (skip absent ones)
-            keys_to_read: dict[int, str] = {}
-            if self._esphome_wifi_key != -1:
-                keys_to_read[self._esphome_wifi_key] = 'wifi'
-            if self._esphome_free_heap_key != -1:
-                keys_to_read[self._esphome_free_heap_key] = 'heap'
-            if self._esphome_max_free_block_key != -1:
-                keys_to_read[self._esphome_max_free_block_key] = 'block'
-
-            if not keys_to_read:
+            keys = self._esphome_diagnostic_keys
+            if not keys:
                 return
+            captured = {}
 
-            captured: dict[int, object] = {}
-            all_received = asyncio.Event()
+            def on_state(state):
+                key = getattr(state, "key", None)
+                if key in keys and key not in captured:
+                    value = getattr(state, "state", None)
+                    if value is not None:
+                        captured[key] = value
+                        if len(captured) >= len(keys):
+                            received.set()
 
-            def _on_state(state) -> None:
-                key = getattr(state, 'key', None)
-                if key in keys_to_read and key not in captured:
-                    captured[key] = getattr(state, 'state', None)
-                    if len(captured) >= len(keys_to_read):
-                        all_received.set()
-
-            unsub = api.subscribe_states(_on_state)
+            received = asyncio.Event()
+            unsubscribe = api.subscribe_states(on_state)
             try:
-                await asyncio.wait_for(all_received.wait(), timeout=3.0)
+                await asyncio.wait_for(received.wait(), timeout=3.0)
             except asyncio.TimeoutError:
-                logger.debug(f"Timeout reading ESP32 diagnostic sensors (got {len(captured)}/{len(keys_to_read)})")
+                logger.debug("ESPHome diagnostics: received %s/%s sensors", len(captured), len(keys))
             finally:
-                try:
-                    unsub()
-                except Exception:
-                    pass
+                unsubscribe()
 
-            # Store captured values
-            if self._esphome_wifi_key in captured and captured[self._esphome_wifi_key] is not None:
-                self.esphome_wifi_rssi = round(float(captured[self._esphome_wifi_key]), 1)
-                logger.debug(f"ESP32 WiFi RSSI: {self.esphome_wifi_rssi} dBm")
-            if self._esphome_free_heap_key in captured and captured[self._esphome_free_heap_key] is not None:
-                _fh = float(captured[self._esphome_free_heap_key])
-                if not math.isnan(_fh):
-                    self.esphome_free_heap = int(_fh)
-                    logger.debug(f"ESP32 Free Heap: {self.esphome_free_heap} B")
-            if self._esphome_max_free_block_key in captured and captured[self._esphome_max_free_block_key] is not None:
-                _mb = float(captured[self._esphome_max_free_block_key])
-                if not math.isnan(_mb):
-                    self.esphome_max_free_block = int(_mb)
-                    logger.debug(f"ESP32 Max Free Block: {self.esphome_max_free_block} B")
-        except Exception as e:
-            logger.debug(f"Failed to read ESP32 diagnostic sensors: {e}")
+            if not captured:
+                return
+            for key, value in captured.items():
+                field = keys[key]
+                try:
+                    if field in ("reset_reason", "bssid"):
+                        setattr(self, "esphome_" + field, str(value))
+                    elif field == "wifi_rssi":
+                        parsed = float(value)
+                        if math.isfinite(parsed):
+                            self.esphome_wifi_rssi = round(parsed, 1)
+                    else:
+                        parsed = float(value)
+                        if math.isfinite(parsed):
+                            setattr(self, "esphome_" + field, int(parsed))
+                except (ValueError, TypeError, OverflowError):
+                    logger.debug("Ignoring invalid ESPHome %s diagnostic: %r", field, value)
+            self.esphome_diagnostics_timestamp = (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            )
+        except Exception as exc:
+            logger.debug("Failed to read optional ESPHome diagnostics: %s", exc)
+
+    async def _read_esphome_wifi_rssi_async(self) -> None:
+        """Compatibility wrapper for existing callers."""
+        await self._read_esphome_diagnostics_async()
 
     async def _invalidate_esphome_api(self, api):
         """Discard an unhealthy API transport without touching a newer connection."""
@@ -513,9 +504,8 @@ class BluetoothLeConnector(IBluetoothLeConnector):
         # that an interrupted inter-VLAN connection has recovered.
         await self.verify_esphome_api(api)
 
-        # Read WiFi signal strength while API is connected and idle (before BLE scan).
-        await self._read_esphome_wifi_rssi_async()
-
+        # Proxy diagnostics are sampled by the independent API watchdog,
+        # not here, to avoid adding latency to every BLE poll.
         t_ble = time.perf_counter()  # BLE timing starts after ESP32 API is ready
 
         mac_int = int(device_id.replace(":", ""), 16)
