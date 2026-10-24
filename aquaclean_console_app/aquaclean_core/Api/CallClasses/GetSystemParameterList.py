@@ -14,18 +14,21 @@ logger = logging.getLogger(__name__)
 class GetSystemParameterList:
 
     """
-    Confirmed semantics from BLE log analysis (2026-04-17):
-    0 userIsSitting        (approach/presence detection)
-    1 unknown              (C# label: analShowerIsRunning — never observed to change)
-    2 ladyShowerIsRunning  (confirmed: changes when lady shower runs)
-    3 analShowerIsRunning  (C# label: dryerIsRunning — confirmed: changes when anal shower runs)
+    SPL parameter semantics used by the bridge:
+    0 userIsSitting
+    1 analShowerIsRunning  (anal shower cycle/state)
+    2 ladyShowerIsRunning
+    3 dryerIsRunning      (dryer cycle/state)
     4 descalingState
     5 descalingDurationInMinutes
     6 lastErrorCode
-    9 orientationLightState (not supported on HB2304EU298413 — echoes 0, device does not respond)
+    9 orientationLightState (Sela; not observed on tested Mera)
 
-    NOTE: C# labels for indices 1 and 3 are swapped relative to confirmed behavior.
-    Dryer running state is NOT exposed via any known GetSPL index.
+    Mapping 1=anal / 3=dryer is backed by physical Mera RS30.0 TS206 tests
+    (upstream #45) and Sela RS08.0 TS57 observations (#52). The former April
+    interpretation 3=anal / 1=unknown is superseded. Values may remain set
+    through the complete shower/dryer cycle, not just physical actuator use.
+    Responses are positional: data_array[i] belongs to parameter_list[i].
     """
 
             

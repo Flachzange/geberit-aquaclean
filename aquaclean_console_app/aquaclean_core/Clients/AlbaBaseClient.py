@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 # Ble20 DpId → SPL data_array index mapping.
 # Mirrors the index expectations in _fetch_state / _state_changed_timer_elapsed:
 #   index 0 = IsUserSitting       (DP_USER_DETECTION_STATUS = 607)
-#   index 1 = IsDryerRunning      (no dryer on Alba → 0)
+#   index 1 = IsAnalShowerRunning (DP_ANAL_SHOWER_STATUS = 564)
 #   index 2 = IsLadyShowerRunning (DP_LADY_SHOWER_STATUS = 872)
-#   index 3 = IsAnalShowerRunning (DP_ANAL_SHOWER_STATUS  = 564)
+#   index 3 = IsDryerRunning      (no dryer on Alba → 0)
 #   index 4 = descaling state     (no equivalent → 0)
 #   index 5 = descaling min       (no equivalent → 0)
 #   index 6 = last error code     (no equivalent → 0)
@@ -39,9 +39,9 @@ _PROFILE_SETTING_DPID: dict[int, DpId] = {
 
 _SPL_DPID: list[Optional[DpId]] = [
     DpId.DP_USER_DETECTION_STATUS,    # 0  — DpId 607; readable on all known Alba devices
-    None,                              # 1  dryer — no equivalent
+    DpId.DP_ANAL_SHOWER_STATUS,        # 1
     DpId.DP_LADY_SHOWER_STATUS,        # 2
-    DpId.DP_ANAL_SHOWER_STATUS,        # 3
+    None,                              # 3  dryer — no equivalent
     None,                              # 4  descaling state
     None,                              # 5  descaling min
     None,                              # 6  last error
@@ -83,7 +83,7 @@ class AlbaBaseClient:
         # Ble20 shower status enums: 0=Error, 1=Disabled, 2=Ready, >=3=active
         # Normalize to 0/1 so callers' != 0 checks work correctly.
         all_data[2] = 1 if all_data[2] >= 3 else 0  # LADY_SHOWER_STATUS
-        all_data[3] = 1 if all_data[3] >= 3 else 0  # ANAL_SHOWER_STATUS
+        all_data[1] = 1 if all_data[1] >= 3 else 0  # ANAL_SHOWER_STATUS
         # Mirror Mera Comfort behaviour: when a short params list is given,
         # data_array[i] = value at params[i].  Full-range calls (e.g. [0..7])
         # are a no-op since params[i] == i for every index.

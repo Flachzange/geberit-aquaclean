@@ -52,9 +52,9 @@ def test_state_poll_uses_two_getspl_requests_and_maps_aux_from_second_result():
     assert "SPL_PARAMS_MERA_COMFORT_AUX" in source
 
     assert "IsUserSitting=state_result.data_array[0] != 0" in source
-    assert "IsAnalShowerRunning=state_result.data_array[3] != 0" in source
+    assert "IsAnalShowerRunning=state_result.data_array[1] != 0" in source
     assert "IsLadyShowerRunning=state_result.data_array[2] != 0" in source
-    assert "IsDryerRunning=state_result.data_array[1] != 0" in source
+    assert "IsDryerRunning=state_result.data_array[3] != 0" in source
 
     assert "LidOffsetPosition=aux_result.data_array[0]" in source
     assert "ShowerArmOffsetPosition=aux_result.data_array[1]" in source

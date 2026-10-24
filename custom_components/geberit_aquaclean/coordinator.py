@@ -734,9 +734,9 @@ class AquaCleanCoordinator(DataUpdateCoordinator):
             "initial_operation_date": initial_op_date,
             # Live state
             "is_user_sitting": state.data_array[0] != 0,
-            "is_anal_shower_running": state.data_array[3] != 0,
+            "is_anal_shower_running": state.data_array[1] != 0,
             "is_lady_shower_running": state.data_array[2] != 0,
-            "is_dryer_running": state.data_array[1] != 0,
+            "is_dryer_running": state.data_array[3] != 0,
             "last_error_code": state.data_array[6],
             "lid_offset_position": state.data_array[8],        # SPL index 12, position 8
             "shower_arm_offset_position": state.data_array[9], # SPL index 13, position 9
@@ -829,7 +829,7 @@ class AquaCleanCoordinator(DataUpdateCoordinator):
             "initial_operation_date": "",
             # Live state (shared keys with Mera for binary sensors)
             "is_user_sitting": state.data_array[0] != 0,
-            "is_anal_shower_running": state.data_array[3] != 0,
+            "is_anal_shower_running": state.data_array[1] != 0,
             "is_lady_shower_running": False,
             "is_dryer_running": False,
             "last_error_code": 0,

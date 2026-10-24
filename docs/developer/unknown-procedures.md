@@ -352,6 +352,11 @@ Confirmed IDs: 0–9 and 13. IDs **10, 11, 12** fall between `DryerState`(9) and
 
 ## 4. GetSystemParameterList — Confirmed and Unknown Indices
 
+> **Superseded mapping (2026-10-24):** The historical April interpretation of
+> indices 1/3 below is not the current fork mapping. Physical Mera tests (#45)
+> and Sela observations (#52) support 1=anal cycle/state, 3=dryer cycle/state.
+> See [the current protocol reference](ble-protocol.md#state-mapping-correction-2026-10-24).
+
 The bridge/spl-monitor polls the iPhone's 12-param list `[0, 1, 2, 3, 4, 5, 6, 7, 4, 8, 9, 10]`
 (single call; index 4 duplicated exactly as observed in iPhone BLE traffic). Updated 2026-04-17
 after the CONS frame bug fix enabled >8 params. Prior 8-param limit was NOT a device constraint —

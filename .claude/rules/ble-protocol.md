@@ -200,13 +200,15 @@ To probe on an **AcSela**:
 Args format: `count(1 byte)` + `param indices` + `zero-pad to 13 bytes total`.
 A non-zero response value = live orientation light state on AcSela.
 
-### SPL parameter semantics — label corrections
+### SPL parameter semantics — correction (2026-10-24)
 
-Some code comment labels are misleading:
-- **Index 0** — `StateUserPresent` — seat sensor ✅ correct
-- **Index 1** — labelled `analShowerIsRunning` in code — actually tracks **user sitting**
-- **Index 3** — labelled `dryerIsRunning` — actually tracks **anal shower running**
-- Dryer state: not visible in any captured SPL change — possibly different index or polled differently
+Use index **1** for the anal shower cycle/state and **3** for the dryer
+cycle/state. The earlier April interpretation (1=user sitting, 3=anal) is
+superseded by physical Mera RS30.0 TS206 tests in upstream issue #45 and
+Sela RS08.0 TS57 observations in #52. A separately started dryer sets only
+p3; a Mera shower with automatic drying may keep both p1 and p3 set until
+its complete cycle finishes. These are not strict actuator-running bits.
+Index 0 remains user sitting; index 2 remains lady shower.
 
 ### SPL anal-shower packed field (Index 1)
 

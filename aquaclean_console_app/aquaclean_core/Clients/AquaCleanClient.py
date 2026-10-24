@@ -112,9 +112,9 @@ class AquaCleanClient(IAquaCleanClient):
 
         device_state_changed_event_args = DeviceStateChangedEventArgs(
             IsUserSitting=state_result.data_array[0] != 0,
-            IsAnalShowerRunning=state_result.data_array[3] != 0,  # param 3 confirmed = anal shower
+            IsAnalShowerRunning=state_result.data_array[1] != 0,  # param 1 = anal shower cycle/state
             IsLadyShowerRunning=state_result.data_array[2] != 0,
-            IsDryerRunning=state_result.data_array[1] != 0,  # param 1, dryer state unknown
+            IsDryerRunning=state_result.data_array[3] != 0,  # param 3 = dryer cycle/state
             LidOffsetPosition=aux_result.data_array[0],       # legacy field name; SPL index 12
             ShowerArmOffsetPosition=aux_result.data_array[1], # legacy field name; SPL index 13
         )

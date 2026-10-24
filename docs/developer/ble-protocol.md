@@ -128,6 +128,36 @@ Shorter payloads cause the device to return **error 0xF7** immediately.
 
 ## GetSystemParameterList (0x0D)
 
+### State mapping correction (2026-10-24)
+
+The fork uses **parameter 1 = anal shower cycle/state** and **parameter 3 =
+dryer cycle/state** in persistent polling, on-demand queries, CLI and HACS.
+The Alba Ble20 adapter synthesizes the same layout (no dryer, so p3=0).
+MQTT topics and external JSON field names stay unchanged.
+
+Evidence: [upstream #45](https://github.com/jens62/geberit-aquaclean/issues/45)
+(Mera Comfort RS30.0 TS206, physical test on 2026-08-19) and
+[#52](https://github.com/jens62/geberit-aquaclean/issues/52)
+(Sela RS08.0 TS57, reported 2026-10-24).
+
+| Physical state, Mera RS30.0 TS206 | p1 | p3 |
+|---|---:|---:|
+| Idle, user seated | 0 | 0 |
+| Dryer started separately | 0 | 1 |
+| Anal shower running | 1 | 1 |
+| Automatic drying after shower | 1 | 1 |
+| Full cycle finished | 0 | 0 |
+
+Thus these values can represent a complete cycle, rather than only the
+actuator running at that instant. Keep the existing non-zero check, including
+for packed values such as 1280. Do not OR p1/p3 for anal shower detection:
+a separately started dryer would then be reported as an anal shower.
+
+This supersedes the April interpretation in `unknown-procedures.md`.
+Other hardware/firmware combinations have not been revalidated by this fix.
+The existing split GetSPL requests remain unchanged.
+
+
 Reads live device state.
 
 **Bridge (current):** requests 8 params `[0,1,2,3,4,5,6,7]`.
