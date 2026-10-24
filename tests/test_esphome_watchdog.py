@@ -9,6 +9,7 @@ import ast
 import asyncio
 import logging
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -63,11 +64,17 @@ class FakeConnector:
         self._ensure_esphome_api_connected = AsyncMock(return_value=self._esphome_api)
         self.verify_esphome_api = AsyncMock()
         self.disconnect = AsyncMock()
+        self._read_esphome_diagnostics_async = AsyncMock()
+        self.esphome_diagnostics_timestamp = None
+        for field in ("wifi_rssi", "free_heap", "max_free_block", "min_free_heap",
+                      "uptime", "reset_reason", "bssid"):
+            setattr(self, "esphome_" + field, None)
         self.__class__.instances.append(self)
 
 
 api_ns = {
     "asyncio": asyncio,
+    "time": time,
     "logger": logger,
     "ESPHomeConnectionError": ESPHomeConnectionError,
     "BluetoothLeConnector": FakeConnector,
@@ -200,6 +207,7 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
         mode._poll_wakeup = asyncio.Event()
         mode._esphome_api_ready = asyncio.Event()
         mode._esphome_recovered_pending = False
+        mode._next_esphome_diagnostics_at = 0.0
         mode._esphome_watchdog_online = None
         mode.service = types.SimpleNamespace(
             mqttConfig={"topic": "Geberit/AquaClean"},
@@ -305,6 +313,27 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(mode._esphome_api_ready.is_set())
         self.assertIs(mode._esphome_watchdog_online, True)
         FakeConnector.instances[-1].disconnect.assert_awaited_once()
+
+    async def test_diagnostics_published_without_ble_poll(self):
+        mode = self.mode()
+
+        class SamplingConnector(FakeConnector):
+            def __init__(self, *args):
+                super().__init__(*args)
+                self.esphome_diagnostics_timestamp = "2026-10-23T08:00:00Z"
+                self.esphome_uptime = 123
+                self.esphome_bssid = "AA:BB:CC:DD:EE:FF"
+
+        old_connector = api_ns["BluetoothLeConnector"]
+        api_ns["BluetoothLeConnector"] = SamplingConnector
+        try:
+            await mode._probe_esphome_proxy()
+        finally:
+            api_ns["BluetoothLeConnector"] = old_connector
+        self.assertEqual(mode.service._update_esphome_proxy_state.await_count, 2)
+        diagnostics_call = mode.service._update_esphome_proxy_state.await_args.kwargs
+        self.assertEqual(diagnostics_call["uptime"], 123)
+        self.assertEqual(diagnostics_call["bssid"], "AA:BB:CC:DD:EE:FF")
 
     def test_polling_gate_and_resume_paths_exist(self):
         source = (ROOT / "aquaclean_console_app/main.py").read_text(encoding="utf-8")
